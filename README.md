@@ -781,3 +781,19 @@ console.log("pid =", callNative(getpidPtr))
 - `callNative()` 当前主要面向整数/指针参数，不适合复杂 ABI 封送
 - `Java.ready()` 主要解决 spawn 场景下 app `ClassLoader` 尚未就绪的问题
 - 需要稳定 hook Java 层时，优先先 `Java.ready(...)` 再 `Java.use(...)`
+
+## 13. 仓库内测试（无需 NDK）
+
+```bash
+# host-tests：agent 纯逻辑（ghostmem 分配器 + LZ4 压缩）—— 10 测试
+cd host-tests && cargo test
+
+# trace-decoder：trace 块流解码 —— 8 测试（多块 roundtrip + 真实编码器 e2e）
+cd trace-decoder && cargo test
+```
+
+- 两个 crate 用独立 `[workspace]` + 子目录 `.cargo/config.toml` 覆盖根配置的
+  android target，在宿主机直接编译测试（根 `.cargo/config.toml` 强制
+  `aarch64-linux-android` + NDK linker，本仓库开发机无 NDK）。
+- `host-tests/src/` 是 agent 模块的同步副本：修改 `agent/src/{ghostmem.rs,
+  trace/lz4_block.rs}` 后运行 `host-tests/sync.sh` 再提交。
