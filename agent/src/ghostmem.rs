@@ -132,6 +132,35 @@ impl Drop for GhostMem {
 // 幽灵内存是内核页表映射，不经过 Rust 分配器；Send/Sync 由调用方约束。
 unsafe impl Send for GhostMem {}
 
+/* ---- frida-gum stealth allocator 对接（gum 17.x 提供 gum_set_stealth_alloc）----
+ * 当前仓库锁定 frida-gum 16.7.18（无该 API）。升级到 17.x 后：
+ *   gum_set_stealth_alloc(stealth_alloc, stealth_free);
+ * 这两个 extern "C" 函数签名与 GumStealthAlloc/GumStealthFree 一致，
+ * 可直接作为回调注册。 */
+
+/// Stealth 分配回调：size 字节 -> 幽灵内存地址（模块未加载返回 NULL）。
+/// 签名对齐 frida-gum `GumStealthAlloc`（gpointer (*)(gsize)）。
+#[no_mangle]
+pub extern "C" fn stealth_alloc(size: usize) -> *mut std::ffi::c_void {
+    match GhostMem::alloc_size(size) {
+        Ok(m) => m.as_ptr() as *mut std::ffi::c_void,
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Stealth 释放回调：gum 侧释放跳板内存。
+/// 签名对齐 frida-gum `GumStealthFree`（void (*)(gpointer)）。
+/// 注意：GhostMem 在 Drop 时释放；此回调用于提前释放场景。
+#[no_mangle]
+pub extern "C" fn stealth_free(mem: *mut std::ffi::c_void) {
+    if mem.is_null() {
+        return;
+    }
+    unsafe {
+        libc::prctl(PR_GHOSTMEM_FREE, 0, mem as c_ulong, 0, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +181,20 @@ mod tests {
     fn alloc_without_module_fails_cleanly() {
         // host 上无 ghostmem 内核模块：prctl 返回负值 -> Err（不 panic）
         assert!(GhostMem::alloc(1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stealth_tests {
+    use super::*;
+
+    #[test]
+    fn stealth_alloc_without_module_returns_null() {
+        assert!(stealth_alloc(4096).is_null());
+    }
+
+    #[test]
+    fn stealth_free_null_is_noop() {
+        stealth_free(std::ptr::null_mut());
     }
 }
