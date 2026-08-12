@@ -213,4 +213,29 @@ mod tests {
         // 匹配与字面量重叠（如 "abcabcabc"）
         roundtrip(b"abcabcabcabcabcabcabcabc");
     }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn throughput_meets_trace_average() {
+        // 性能验收（仅 release 模式；debug 无优化，速率无意义）：
+        // 压缩速率须远超视频 trace 平均速率（2936 万指令/7.45s
+        // = 394 万 insns/s ≈ 31.5 MB/s 原始地址流）。断言 >100 MB/s（~3x 余量）。
+        let mut batch = Vec::with_capacity(4096 * 8);
+        let base: u64 = 0x78aabbcc0000;
+        for i in 0..4096u64 {
+            batch.extend_from_slice(&(base + i * 4).to_le_bytes());
+        }
+        let total = 16 * 1024 * 1024usize; // 16MB
+        let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut written = 0usize;
+        while written < total {
+            out.clear();
+            compress_into(&batch, &mut out);
+            written += batch.len();
+        }
+        let el = t0.elapsed();
+        let mbps = (written as f64 / 1048576.0) / el.as_secs_f64();
+        assert!(mbps > 100.0, "compress too slow: {:.0} MB/s (need >100)", mbps);
+    }
 }
