@@ -13,6 +13,11 @@ git lfs pull
 
 - JS 全局对象新增 `qbdi`
   - 用于在设备侧直接创建 QBDI VM、配置插桩范围、模拟调用、执行 `run()` 和读取寄存器返回值。
+- `agent/src/ghostmem.rs`（Phase 2）—— VMA-Less 幽灵内存分配器 + stealth alloc/free 回调
+  - 对接 mkpms `ghostmem` KPM 模块的 prctl 接口（`0x47474d01/02/03`），`/proc/maps` 不可见。
+  - 依赖 frida-gum 17.x 的 `gum_set_stealth_alloc` 注册（当前锁定 16.7.18 无此 API）。
+- `agent/src/trace/lz4_block.rs` + `trace-decoder/`（Phase 3）—— Stalker trace LZ4 压缩落盘与 host 解码
+  - 落盘块格式 `[u32 raw][u32 comp][LZ4]`；`trace-decoder` 解回指令地址流（见 `trace-decoder/README.md`）。
 
 ## 1. 进入 JS 环境
 
