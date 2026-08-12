@@ -10,6 +10,8 @@
 //!
 //! 供 Chronos 风格 TTD 分析 / AI MCP 的宿主侧解析（方案 #8 分析侧闭环）。
 
+mod lz4_block;
+
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
@@ -200,5 +202,67 @@ mod tests {
         assert_eq!(insns.len(), 24);
         assert_eq!(insns[0], 0x1000);
         assert_eq!(insns[23], 0x1000 + 2 * 0x100 + 7 * 4);
+    }
+}
+
+/// 端到端：真实编码器（lz4_block，含匹配压缩）→ 解码器
+#[cfg(test)]
+mod e2e_real_encoder {
+    use super::lz4_decompress;
+    use crate::lz4_block::compress_into;
+
+    fn build_trace_file(blocks: usize) -> Vec<u8> {
+        let mut trace = Vec::new();
+        for blk in 0..blocks as u64 {
+            // 高重复流：同模块顺序执行（地址高字节恒定）
+            let mut raw = Vec::new();
+            for i in 0..4096u64 {
+                raw.extend_from_slice(&(0x78aabbcc0000 + blk * 0x100000 + i * 4).to_le_bytes());
+            }
+            let mut comp = Vec::new();
+            compress_into(&raw, &mut comp);
+            trace.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            trace.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+            trace.extend_from_slice(&comp);
+        }
+        trace
+    }
+
+    fn decode_all(trace: &[u8]) -> (usize, u64, u64) {
+        let mut ip = 0usize;
+        let mut insns = 0usize;
+        let mut min = u64::MAX;
+        let mut max = 0u64;
+        while ip + 8 <= trace.len() {
+            let raw_len = u32::from_le_bytes(trace[ip..ip + 4].try_into().unwrap()) as usize;
+            let comp_len = u32::from_le_bytes(trace[ip + 4..ip + 8].try_into().unwrap()) as usize;
+            ip += 8;
+            let block = lz4_decompress(&trace[ip..ip + comp_len]).unwrap();
+            assert_eq!(block.len(), raw_len);
+            ip += comp_len;
+            for ch in block.chunks_exact(8) {
+                let a = u64::from_le_bytes(ch.try_into().unwrap());
+                insns += 1;
+                if a < min { min = a; }
+                if a > max { max = a; }
+            }
+        }
+        (insns, min, max)
+    }
+
+    #[test]
+    fn multi_block_real_compression_roundtrip() {
+        let trace = build_trace_file(4); // 4 块 × 4096 条
+        let (insns, min, max) = decode_all(&trace);
+        assert_eq!(insns, 4 * 4096);
+        assert_eq!(min, 0x78aabbcc0000);
+        assert_eq!(max, 0x78aabbcc0000 + 3 * 0x100000 + 4095 * 4);
+    }
+
+    #[test]
+    fn compression_actually_reduces_size() {
+        let trace = build_trace_file(1);
+        // 块头 8 字节 + 压缩数据；高重复流应显著小于 32KB 原始
+        assert!(trace.len() < 4096 * 8 * 60 / 100, "expected <60%, got {}", trace.len());
     }
 }
