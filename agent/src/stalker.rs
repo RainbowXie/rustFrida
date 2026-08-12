@@ -111,7 +111,8 @@ lazy_static! {
             };
 
             /* LZ4 块压缩落盘：批量缓冲指令地址，满一块（BATCH 条）后压缩写入。
-             * 块格式：[u32 解压后字节数][LZ4 压缩数据]，host 侧按此解回。
+             * 块格式：[u32 解压后字节数][u32 压缩后字节数][LZ4 数据]，
+             * host 侧 trace-decoder 按此解回（压缩长度用于定位块边界）。
              * 相比逐条裸写，重复地址流（同模块顺序执行）压缩率极高。 */
             const LZ4_BATCH: usize = 4096;
             let mut batch: Vec<u8> = Vec::with_capacity(LZ4_BATCH * 8);
@@ -122,8 +123,10 @@ lazy_static! {
                 if batch.len() >= LZ4_BATCH * 8 {
                     compressed.clear();
                     crate::trace::lz4_compress(&batch, &mut compressed);
-                    let mut header = (batch.len() as u32).to_le_bytes();
-                    if let Err(e) = log_file.write_all(&header).and_then(|_| {
+                    let mut hdr = [0u8; 8];
+                    hdr[0..4].copy_from_slice(&(batch.len() as u32).to_le_bytes());
+                    hdr[4..8].copy_from_slice(&(compressed.len() as u32).to_le_bytes());
+                    if let Err(e) = log_file.write_all(&hdr).and_then(|_| {
                         log_file.write_all(&compressed)
                     }) {
                         log_msg(format!("写入日志失败: {}", e));
@@ -136,8 +139,10 @@ lazy_static! {
             if !batch.is_empty() {
                 compressed.clear();
                 crate::trace::lz4_compress(&batch, &mut compressed);
-                let mut header = (batch.len() as u32).to_le_bytes();
-                let _ = log_file.write_all(&header).and_then(|_| log_file.write_all(&compressed));
+                let mut hdr = [0u8; 8];
+                hdr[0..4].copy_from_slice(&(batch.len() as u32).to_le_bytes());
+                hdr[4..8].copy_from_slice(&(compressed.len() as u32).to_le_bytes());
+                let _ = log_file.write_all(&hdr).and_then(|_| log_file.write_all(&compressed));
             }
         });
 
