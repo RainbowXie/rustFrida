@@ -1,3 +1,5 @@
+/* NOTE: 本文件是 agent/src/trace/lz4_block.rs 的同步副本（供 trace-decoder 独立
+ * 构建）；修改 agent 版后需同步。 */
 //! LZ4 块压缩（LZ4 block format）
 //!
 //! 用于 trace 数据落盘前的实时压缩（对齐视频方案 #8：Stalker trace + LZ4）。
