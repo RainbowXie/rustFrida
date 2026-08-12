@@ -3,7 +3,8 @@
 //! 内核侧：`kpms/ghostmem/`（mkpms 仓库）通过 prctl 暴露 VMA-Less 内存：
 //! - `PR_GHOSTMEM_ALLOC 0x47474d01`：prctl(opt, 0, nr_pages, prot, 0) -> VA
 //! - `PR_GHOSTMEM_FREE  0x47474d02`：prctl(opt, 0, va, 0, 0)
-//! - `PR_GHOSTMEM_INFO  0x47474d03`：prctl(opt, 0, buf, len, 0)（pid 必须为 0）
+//! - `PR_GHOSTMEM_INFO  0x47474d03`：prctl(opt, pid, buf, len, 0)
+//! - `PR_GHOSTMEM_WRITE 0x47474d04` / `READ 0x47474d05`：prctl(opt, pid, va, buf, len) 跨进程读写
 //!
 //! 该内存不登记 VMA，`/proc/<pid>/maps` 不可见。用于 stealth trampoline
 //! （`gum_set_stealth_alloc`）与自定义 Linker 的代码存放。
@@ -20,6 +21,8 @@ use std::ptr;
 const PR_GHOSTMEM_ALLOC: c_int = 0x47474d01;
 const PR_GHOSTMEM_FREE: c_int = 0x47474d02;
 const PR_GHOSTMEM_INFO: c_int = 0x47474d03;
+const PR_GHOSTMEM_WRITE: c_int = 0x47474d04;
+const PR_GHOSTMEM_READ: c_int = 0x47474d05;
 
 /// PROT_* 位（与内核 GHOSTMEM_PROT_* 对齐）
 const PROT_READ: c_ulong = 0x1;
@@ -101,13 +104,13 @@ impl GhostMem {
         }
     }
 
-    /// 查询当前进程幽灵内存统计（内核 INFO 接口）
-    pub fn stats() -> Result<GhostmemStats, String> {
+    /// 查询幽灵内存统计（任意 pid；缓冲在当前进程，内核 PTE 拷贝）
+    pub fn stats(pid: libc::pid_t) -> Result<GhostmemStats, String> {
         let mut st = GhostmemStats::default();
         let ret = unsafe {
             libc::prctl(
                 PR_GHOSTMEM_INFO,
-                0,            // pid 必须为 0（经 PTE 拷贝缓冲）
+                pid as c_ulong,
                 &mut st as *mut GhostmemStats as c_ulong,
                 std::mem::size_of::<GhostmemStats>() as c_ulong,
                 0,
@@ -117,6 +120,31 @@ impl GhostMem {
             return Err(format!("ghostmem: INFO failed: {}", Error::last_os_error()));
         }
         Ok(st)
+    }
+
+    /// 跨进程读目标 pid 的幽灵内存（内核 PTE 读写，无 ptrace 依赖）
+    pub fn read_at_cross(pid: libc::pid_t, va: *mut u8, len: usize) -> Result<Vec<u8>, String> {
+        let mut buf = vec![0u8; len];
+        let ret = unsafe {
+            libc::prctl(PR_GHOSTMEM_READ, pid as c_ulong, va as c_ulong,
+                        buf.as_mut_ptr() as c_ulong, len as c_ulong)
+        };
+        if ret < 0 {
+            return Err(format!("ghostmem: READ failed: {}", Error::last_os_error()));
+        }
+        Ok(buf)
+    }
+
+    /// 跨进程写目标 pid 的幽灵内存（内核 PTE 读写，无 ptrace 依赖）
+    pub fn write_at_cross(pid: libc::pid_t, va: *mut u8, data: &[u8]) -> Result<(), String> {
+        let ret = unsafe {
+            libc::prctl(PR_GHOSTMEM_WRITE, pid as c_ulong, va as c_ulong,
+                        data.as_ptr() as c_ulong, data.len() as c_ulong)
+        };
+        if ret < 0 {
+            return Err(format!("ghostmem: WRITE failed: {}", Error::last_os_error()));
+        }
+        Ok(())
     }
 }
 
