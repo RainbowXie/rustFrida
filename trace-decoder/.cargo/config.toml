@@ -1,0 +1,4 @@
+# trace-decoder 是纯 host 工具：覆盖根 workspace 的 [build] target
+# （根 .cargo/config.toml 强制 aarch64-linux-android + NDK linker）。
+[build]
+target = "x86_64-unknown-linux-gnu"

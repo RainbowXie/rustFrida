@@ -7,3 +7,4 @@ qbdi/libQBDI.a
 loader/loader_check.o
 tools/*_test.js
 tools/*_test.sh
+trace-decoder/target/

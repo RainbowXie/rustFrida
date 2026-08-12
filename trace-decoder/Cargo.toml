@@ -6,3 +6,5 @@ description = "Host tool: decode rustFrida LZ4 trace blocks to instruction addre
 license = "GPL-2.0-or-later"
 
 [dependencies]
+
+[workspace]
