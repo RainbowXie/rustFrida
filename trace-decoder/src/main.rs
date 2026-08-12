@@ -5,8 +5,8 @@
 //!   每块解压后是 8 字节小端指令地址的连续序列。
 //!
 //! 用法：
-//!   trace-decoder trace.pb            # 解码，逐行输出 0x 地址
-//!   trace-decoder trace.pb --count    # 只输出统计（块数/指令数/地址范围）
+//!   trace-decoder trace.lz4            # 解码，逐行输出 0x 地址
+//!   trace-decoder trace.lz4 --count    # 只输出统计（块数/指令数/地址范围）
 //!
 //! 供 Chronos 风格 TTD 分析 / AI MCP 的宿主侧解析（方案 #8 分析侧闭环）。
 
@@ -104,7 +104,7 @@ fn lz4_compress_simple(input: &[u8]) -> Vec<u8> {
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <trace.pb> [--count|--range]", args[0]);
+        eprintln!("usage: {} <trace.lz4> [--count|--range]", args[0]);
         std::process::exit(2);
     }
 

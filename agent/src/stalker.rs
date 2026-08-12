@@ -58,7 +58,7 @@ struct RawInstrMessage {
     regs: [u64; 32],
 }
 
-// 定义指令跟踪消息（最终写入文件的 protobuf 格式）
+// 指令跟踪消息（protobuf 格式定义，当前落盘走 LZ4 地址块流，见下方写路径）
 #[derive(Clone, PartialEq, Message)]
 struct InstrMessage {
     #[prost(uint64, tag = "1")]
@@ -91,7 +91,7 @@ lazy_static! {
 
         thread::spawn(move || {
             let log_path = match OUTPUT_PATH.get() {
-                Some(base) => format!("{}/trace.pb", base),
+                Some(base) => format!("{}/trace.lz4", base),
                 None => {
                     log_msg("错误: OUTPUT_PATH 未设置，无法创建日志文件".to_string());
                     return;

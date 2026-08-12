@@ -21,14 +21,14 @@ Host 侧指令 trace 解码工具：读取 rustFrida `agent` 的 Stalker 落盘�
 # 独立于 agent 的 Android 构建链（纯 host 工具）
 cargo build -p trace-decoder
 
-./target/debug/trace-decoder trace.pb            # 逐行输出 0x 指令地址
-./target/debug/trace-decoder trace.pb --count    # 统计：块数/指令数/地址范围
+./target/debug/trace-decoder trace.lz4            # 逐行输出 0x 指令地址
+./target/debug/trace-decoder trace.lz4 --count    # 统计：块数/指令数/地址范围
 ```
 
 示例输出：
 
 ```
-$ trace-decoder trace.pb --count
+$ trace-decoder trace.lz4 --count
 blocks=3 insns=24 min=0x1000 max=0x121c
 ```
 
