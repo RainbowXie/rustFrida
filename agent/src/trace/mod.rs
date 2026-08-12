@@ -2,6 +2,7 @@
 
 mod arm64_analysis;
 mod arm64_codegen;
+mod lz4_block;
 mod ptrace_ops;
 mod transformer;
 
