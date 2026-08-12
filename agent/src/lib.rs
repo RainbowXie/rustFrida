@@ -15,6 +15,7 @@ mod arm64_relocator;
 mod communication;
 mod crash_handler;
 mod exec_mem;
+mod ghostmem;
 mod gumlibc;
 mod trace;
 mod vma_name;
