@@ -18,6 +18,7 @@ git lfs pull
   - 依赖 frida-gum 17.x 的 `gum_set_stealth_alloc` 注册（当前锁定 16.7.18 无此 API）。
 - `agent/src/trace/lz4_block.rs` + `trace-decoder/`（Phase 3）—— Stalker trace LZ4 压缩落盘与 host 解码
   - 落盘块格式 `[u32 raw][u32 comp][LZ4]`；`trace-decoder` 解回指令地址流（见 `trace-decoder/README.md`）。
+- Android 16 soinfo 隐藏改为加载后显式事务：`.init_array` 只登记身份，`hide_from_solist(handle)` 在 `android_dlopen_ext()` 返回后摘除 `soinfo` 与 `_r_debug.r_map`。`--debug-inject so-empty` 使用真实 ARM64 `ET_DYN` 空 SO；`/memfd:wwb_so` 是 rustFrida 自己的载荷名。已验证范围见 `agent/src/hide_soinfo.md`。
 
 ## 1. 进入 JS 环境
 
@@ -785,7 +786,7 @@ console.log("pid =", callNative(getpidPtr))
 ## 13. 仓库内测试（无需 NDK）
 
 ```bash
-# host-tests：agent 纯逻辑（ghostmem 分配器 + LZ4 压缩）—— 10 测试
+# host-tests：ghostmem/LZ4 + HideResult ABI、soinfo parser、empty SO、debug 模式合同
 cd host-tests && cargo test
 
 # trace-decoder：trace 块流解码 —— 8 测试（多块 roundtrip + 真实编码器 e2e）

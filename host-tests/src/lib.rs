@@ -3,3 +3,12 @@
  * 注：副本需与 agent 源同步（agent 侧修改后复制过来）。 */
 pub mod ghostmem;
 pub mod lz4_block;
+
+#[cfg(test)]
+mod debug_inject;
+#[cfg(test)]
+mod empty_so;
+#[cfg(test)]
+mod hide_result_abi;
+#[cfg(test)]
+mod soinfo_next;

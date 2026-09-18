@@ -1,6 +1,9 @@
 fn main() {
     cc::Build::new()
+        .include("../agent/src")
         .file("../agent/src/hide_soinfo.c")
+        .file("../agent/src/hide_linker.c")
+        .file("../agent/src/hide_txn.c")
         .compile("hide_soinfo");
 
     let manifest_dir =
@@ -34,8 +37,11 @@ fn main() {
     }
 
     println!(
-        "cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,rust_get_hide_result,--export-dynamic-symbol=get_hide_result,--export-dynamic-symbol=rust_get_hide_result"
+        "cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,rust_get_hide_result,-u,hide_from_solist,--export-dynamic-symbol=get_hide_result,--export-dynamic-symbol=rust_get_hide_result,--export-dynamic-symbol=hide_from_solist"
     );
     println!("cargo:rerun-if-changed=../agent/src/hide_soinfo.c");
+    println!("cargo:rerun-if-changed=../agent/src/hide_soinfo.h");
+    println!("cargo:rerun-if-changed=../agent/src/hide_linker.c");
+    println!("cargo:rerun-if-changed=../agent/src/hide_txn.c");
     println!("cargo:rerun-if-changed={}", qbdi_archive.display());
 }

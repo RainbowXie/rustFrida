@@ -46,11 +46,17 @@ use std::time::Duration;
 // 通过 Rust #[no_mangle] 重导出到动态符号表，供 host 端 dlsym 查询
 extern "C" {
     fn get_hide_result() -> *const c_void;
+    fn hide_from_solist(handle: *mut c_void) -> i32;
 }
 
 #[no_mangle]
 pub extern "C" fn rust_get_hide_result() -> *const c_void {
     unsafe { get_hide_result() }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_hide_from_solist(handle: *mut c_void) -> i32 {
+    unsafe { hide_from_solist(handle) }
 }
 
 // 定义我们自己的Result类型，错误统一为String

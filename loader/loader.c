@@ -76,6 +76,26 @@ typedef int (*pthread_detach_t)(pthread_t);
 typedef void* (*dlsym_t)(void*, const char*);
 typedef char* (*dlerror_t)();
 typedef size_t (*strlen_t)(const char *);
+typedef int (*hide_from_solist_t)(void*);
+
+struct hide_result {
+    int32_t version;
+    int32_t stage;
+    int32_t status;
+    int32_t next_offset;
+    int32_t entries_scanned;
+    int32_t sym_matched;
+    int32_t soinfo_state;
+    int32_t link_map_state;
+    int32_t wrote;
+    int32_t _pad;
+    uint64_t head_ptr;
+    uint64_t target_ptr;
+    char error[128];
+    char target_path[128];
+    char head_path[128];
+};
+typedef struct hide_result* (*get_hide_result_t)(void);
 
 static ssize_t read_full(read_t read_fn, int fd, void* buf, size_t len) {
     size_t done = 0;
@@ -202,8 +222,58 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         return -5;
     }
 
+    /* 隐藏入口必须在摘链前用本次 handle 解析；摘除后公开 dlsym 已不可用。 */
+    char hide_name[23];
+    hide_name[0]='r'; hide_name[1]='u'; hide_name[2]='s'; hide_name[3]='t';
+    hide_name[4]='_'; hide_name[5]='h'; hide_name[6]='i'; hide_name[7]='d';
+    hide_name[8]='e'; hide_name[9]='_'; hide_name[10]='f'; hide_name[11]='r';
+    hide_name[12]='o'; hide_name[13]='m'; hide_name[14]='_'; hide_name[15]='s';
+    hide_name[16]='o'; hide_name[17]='l'; hide_name[18]='i'; hide_name[19]='s';
+    hide_name[20]='t'; hide_name[21]='\0';
+    hide_from_solist_t hide_fn = (hide_from_solist_t)dlsym(handle, hide_name);
+    if (!hide_fn) {
+        hide_name[0]='h'; hide_name[1]='i'; hide_name[2]='d'; hide_name[3]='e';
+        hide_name[4]='_'; hide_name[5]='f'; hide_name[6]='r'; hide_name[7]='o';
+        hide_name[8]='m'; hide_name[9]='_'; hide_name[10]='s'; hide_name[11]='o';
+        hide_name[12]='l'; hide_name[13]='i'; hide_name[14]='s'; hide_name[15]='t';
+        hide_name[16]='\0';
+        hide_fn = (hide_from_solist_t)dlsym(handle, hide_name);
+    }
+    char result_name[22];
+    result_name[0]='r'; result_name[1]='u'; result_name[2]='s'; result_name[3]='t';
+    result_name[4]='_'; result_name[5]='g'; result_name[6]='e'; result_name[7]='t';
+    result_name[8]='_'; result_name[9]='h'; result_name[10]='i'; result_name[11]='d';
+    result_name[12]='e'; result_name[13]='_'; result_name[14]='r'; result_name[15]='e';
+    result_name[16]='s'; result_name[17]='u'; result_name[18]='l'; result_name[19]='t';
+    result_name[20]='\0';
+    get_hide_result_t get_result = (get_hide_result_t)dlsym(handle, result_name);
+
     // 查找符号 (sym_name 已有 NULL 结尾，可直接使用)
     void* sym = dlsym(handle, sym_name);
+
+    if (!hide_fn) {
+        write(ctrl_fd, dlsym_err, dlsym_err_len);
+        close(ctrl_fd);
+        close(memfd);
+        free(offsets);
+        free(dl);
+        free(table);
+        free(agent_args);
+        return -12;
+    }
+    int hide_status = hide_fn(handle);
+    if (hide_status != 1) {
+        struct hide_result *hr = get_result ? get_result() : 0;
+        if (hr && hr->error[0])
+            write(ctrl_fd, hr->error, strlen(hr->error));
+        close(ctrl_fd);
+        close(memfd);
+        free(offsets);
+        free(dl);
+        free(table);
+        free(agent_args);
+        return -13;
+    }
 
     if (sym) {
         pthread_t tid;

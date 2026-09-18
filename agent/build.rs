@@ -1,13 +1,17 @@
 fn main() -> anyhow::Result<()> {
-    // 编译 C 代码
     cc::Build::new().file("src/transform.c").compile("my_c_lib");
 
-    // 编译 soinfo 隐藏构造函数（.init_array，dlopen 时自动执行）
-    // cc::Build::compile() 自动添加 -l static=hide_soinfo
-    // -u get_hide_result 强制拉取 .o（同一 .o 内的 .init_array 构造函数也会被包含）
-    // --export-dynamic-symbol 导出到动态符号表供 dlsym 查询
-    cc::Build::new().file("src/hide_soinfo.c").compile("hide_soinfo");
-    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,--export-dynamic-symbol=get_hide_result");
-
+    // 拆文件后仍用 -u get_hide_result 把隐藏事务整组拉进 cdylib。
+    cc::Build::new()
+        .include("src")
+        .file("src/hide_soinfo.c")
+        .file("src/hide_linker.c")
+        .file("src/hide_txn.c")
+        .compile("hide_soinfo");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,hide_from_solist,-u,rust_hide_from_solist,--export-dynamic-symbol=get_hide_result,--export-dynamic-symbol=hide_from_solist,--export-dynamic-symbol=rust_hide_from_solist");
+    println!("cargo:rerun-if-changed=src/hide_soinfo.c");
+    println!("cargo:rerun-if-changed=src/hide_soinfo.h");
+    println!("cargo:rerun-if-changed=src/hide_linker.c");
+    println!("cargo:rerun-if-changed=src/hide_txn.c");
     Ok(())
 }

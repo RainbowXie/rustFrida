@@ -211,6 +211,7 @@ pub(crate) fn call_target_function(
                         find_map_line_for_addr(pid, regs.pc).unwrap_or_else(|| "<unknown mapping>".to_string());
                     let lr_map =
                         find_map_line_for_addr(pid, regs.regs[30]).unwrap_or_else(|| "<unknown mapping>".to_string());
+                    let _ = set_registers(pid, &orig_regs);
                     return Err(format!(
                         concat!(
                             "函数执行异常，",

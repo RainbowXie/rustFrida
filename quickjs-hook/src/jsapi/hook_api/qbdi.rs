@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 type LastErrorFn = unsafe extern "C" fn() -> *const c_char;
 type ShutdownFn = unsafe extern "C" fn();
 type GetHideResultFn = unsafe extern "C" fn() -> *const HideResult;
+type HideFromSolistFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type VmNewFn = unsafe extern "C" fn() -> u64;
 type VmUnaryFn = unsafe extern "C" fn(u64) -> c_int;
 type VmRangeFn = unsafe extern "C" fn(u64, u64, u64) -> c_int;
@@ -39,10 +40,16 @@ type TraceBundleMetadataFn = unsafe extern "C" fn(*const c_char, u64) -> c_int;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct HideResult {
+    version: i32,
+    stage: i32,
     status: i32,
     next_offset: i32,
     entries_scanned: i32,
     sym_matched: i32,
+    soinfo_state: i32,
+    link_map_state: i32,
+    wrote: i32,
+    _pad: i32,
     head_ptr: u64,
     target_ptr: u64,
     error: [u8; 128],
@@ -99,19 +106,40 @@ unsafe fn resolve_symbol(handle: *mut c_void, name: &str) -> *mut c_void {
     libc::dlsym(handle, sym.as_ptr())
 }
 
+fn resolve_helper_symbol(handle: *mut c_void, name: &str) -> *mut c_void {
+    let sym = CString::new(name).unwrap();
+    unsafe {
+        let ptr = module_dlsym("qbdi_helper.so", name);
+        if ptr.is_null() {
+            libc::dlsym(handle, sym.as_ptr())
+        } else {
+            ptr
+        }
+    }
+}
+
 fn verify_qbdi_helper_hide_result(handle: *mut c_void) {
+    let hide_ptr = {
+        let rust_ptr = resolve_helper_symbol(handle, "rust_hide_from_solist");
+        if rust_ptr.is_null() {
+            resolve_helper_symbol(handle, "hide_from_solist")
+        } else {
+            rust_ptr
+        }
+    };
+    if hide_ptr.is_null() {
+        output_message("[qbdi] qbdi-helper hide_soinfo failed: hide_from_solist not found");
+        return;
+    }
+    let hide_status = unsafe {
+        let hide_from_solist: HideFromSolistFn = std::mem::transmute(hide_ptr);
+        hide_from_solist(handle)
+    };
+
     let fn_ptr = ["rust_get_hide_result", "get_hide_result"]
         .iter()
         .find_map(|name| {
-            let sym = CString::new(*name).unwrap();
-            let ptr = unsafe {
-                let ptr = module_dlsym("qbdi_helper.so", sym.to_str().unwrap());
-                if ptr.is_null() {
-                    libc::dlsym(handle, sym.as_ptr())
-                } else {
-                    ptr
-                }
-            };
+            let ptr = resolve_helper_symbol(handle, name);
             (!ptr.is_null()).then_some(ptr)
         })
         .unwrap_or(std::ptr::null_mut());
@@ -132,10 +160,10 @@ fn verify_qbdi_helper_hide_result(handle: *mut c_void) {
     let result = unsafe { *result_ptr };
     let target_path = HideResult::cstr(&result.target_path);
     let head_path = HideResult::cstr(&result.head_path);
-    if result.status == 1 {
+    if hide_status == 1 && result.status == 1 {
         output_message(&format!(
-            "[qbdi] qbdi-helper hide_soinfo ok: target=\"{}\" next_offset=0x{:x} scanned={} syms={} target=0x{:x}",
-            target_path, result.next_offset, result.entries_scanned, result.sym_matched, result.target_ptr
+            "[qbdi] qbdi-helper hide_soinfo ok: target=\"{}\" next_offset=0x{:x} scanned={} syms={} target=0x{:x} stage={}",
+            target_path, result.next_offset, result.entries_scanned, result.sym_matched, result.target_ptr, result.stage
         ));
         if !head_path.is_empty() {
             output_message(&format!(
@@ -146,8 +174,11 @@ fn verify_qbdi_helper_hide_result(handle: *mut c_void) {
     } else {
         let error = HideResult::cstr(&result.error);
         output_message(&format!(
-            "[qbdi] qbdi-helper hide_soinfo failed: status={} error=\"{}\" next_offset=0x{:x} scanned={} syms={} head=0x{:x} target=0x{:x}",
+            "[qbdi] qbdi-helper hide_soinfo failed: hide_status={} status={} stage={} wrote=0x{:x} error=\"{}\" next_offset=0x{:x} scanned={} syms={} head=0x{:x} target=0x{:x}",
+            hide_status,
             result.status,
+            result.stage,
+            result.wrote,
             error,
             result.next_offset,
             result.entries_scanned,

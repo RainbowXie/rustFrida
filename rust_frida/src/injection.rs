@@ -2,7 +2,6 @@
 
 use libc::{c_void, close, write as libc_write};
 use nix::sys::ptrace;
-use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
@@ -23,7 +22,7 @@ pub(crate) const AGENT_SO: &[u8] = include_bytes!("../../target/aarch64-linux-an
 pub(crate) const QBDI_HELPER_SO: &[u8] = include_bytes!(env!("QBDI_HELPER_SO_PATH"));
 
 /// 最小化空 SO（无符号、无 .init_array），用于隔离 memfd 映射检测
-const EMPTY_SO: &[u8] = include_bytes!("../../loader/build/loader.bin");
+const EMPTY_SO: &[u8] = include_bytes!("../../loader/build/empty.so");
 
 /// 在目标进程中分配内存并写入结构体，返回远程地址。
 fn alloc_and_write_struct<T>(pid: i32, malloc_addr: usize, data: &T, name: &str) -> Result<usize, String> {
@@ -130,6 +129,14 @@ impl InjectionGuard {
         }
     }
 
+    fn set_host_fd(&mut self, host_fd: RawFd) {
+        self.host_fd = host_fd;
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
     /// 注入成功，取走 host_fd，不再自动清理
     fn into_fd(mut self) -> RawFd {
         self.disarmed = true;
@@ -140,7 +147,9 @@ impl InjectionGuard {
 impl Drop for InjectionGuard {
     fn drop(&mut self) {
         if !self.disarmed {
-            unsafe { close(self.host_fd) };
+            if self.host_fd >= 0 {
+                unsafe { close(self.host_fd) };
+            }
             let _ = ptrace::detach(Pid::from_raw(self.pid), None);
         }
     }
@@ -293,6 +302,8 @@ pub(crate) fn inject_to_process(
                     -9 => "loader 读取 agent 长度失败",
                     -10 => "loader 接收 agent blob 失败",
                     -11 => "loader 写入 memfd 失败",
+                    -12 => "dlsym(hide_from_solist) 失败",
+                    -13 => "加载成功但隐藏事务失败",
                     _ => "未知错误",
                 };
                 let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
@@ -333,10 +344,9 @@ pub(crate) fn inject_to_process(
         }
         Err(e) => {
             log_error!("执行 shellcode 失败: {}", e);
-            log_warn!("暂停目标进程，等待调试器附加...");
             let fd = guard.into_fd();
             unsafe { close(fd) };
-            let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
+            let _ = ptrace::detach(Pid::from_raw(pid), None);
             Err(e)
         }
     }
@@ -408,19 +418,25 @@ impl DebugInjectMode {
     }
 }
 
-/// hide_soinfo 调试结果，与 hide_soinfo.c 中的 struct hide_result ABI 一致
+/// hide_soinfo 调试结果，与 hide_soinfo.h 中的 struct hide_result ABI 一致
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct HideResult {
-    status: i32,            // 0=未执行, 1=成功, 负数=错误码
-    next_offset: i32,       // 推导出的 soinfo::next 偏移, -1=失败
-    entries_scanned: i32,   // 遍历的 soinfo 条目数
-    sym_matched: i32,       // 匹配的 linker 符号数
-    head_ptr: u64,          // solist head 地址
-    target_ptr: u64,        // 被隐藏的 soinfo 地址
-    error: [u8; 128],       // 错误描述
-    target_path: [u8; 128], // 被隐藏目标的路径
-    head_path: [u8; 128],   // head 的路径
+    version: i32,
+    stage: i32,
+    status: i32,
+    next_offset: i32,
+    entries_scanned: i32,
+    sym_matched: i32,
+    soinfo_state: i32,
+    link_map_state: i32,
+    wrote: i32,
+    _pad: i32,
+    head_ptr: u64,
+    target_ptr: u64,
+    error: [u8; 128],
+    target_path: [u8; 128],
+    head_path: [u8; 128],
 }
 
 impl Default for HideResult {
@@ -573,6 +589,76 @@ fn dlopen_agent_via_ptrace(
     Ok(handle)
 }
 
+fn remote_dlsym(pid: i32, dl: &DlOffsets, offsets: &LibcOffsets, handle: usize, name: &[u8]) -> Result<usize, String> {
+    let name_addr = call_target_function(pid, offsets.malloc, &[name.len()], None)
+        .map_err(|e| format!("分配符号名失败: {}", e))?;
+    write_bytes(pid, name_addr, name)?;
+    let ptr = call_target_function(pid, dl.dlsym, &[handle, name_addr], None);
+    let _ = call_target_function(pid, offsets.free, &[name_addr], None);
+    ptr.map_err(|e| format!("dlsym 失败: {}", e))
+}
+
+fn log_hide_result(r: &HideResult) {
+    let tp_str = HideResult::cstr(&r.target_path);
+    let hp_str = HideResult::cstr(&r.head_path);
+    let err_str = HideResult::cstr(&r.error);
+    if r.status == 1 {
+        log_success!("hide_soinfo: 成功隐藏 \"{}\"", tp_str);
+    } else {
+        log_error!(
+            "hide_soinfo: 失败 status={} stage={} wrote=0x{:x} soinfo={} link_map={}",
+            r.status, r.stage, r.wrote, r.soinfo_state, r.link_map_state
+        );
+        if !err_str.is_empty() {
+            log_error!("  error: {}", err_str);
+        }
+    }
+    log_info!(
+        "  version={} next_offset=0x{:x} scanned={} syms={}",
+        r.version, r.next_offset, r.entries_scanned, r.sym_matched
+    );
+    log_info!("  head=\"{}\" target=0x{:x}", hp_str, r.target_ptr);
+}
+
+fn invoke_hide_from_solist(
+    pid: i32,
+    handle: usize,
+    offsets: &LibcOffsets,
+    dl: &DlOffsets,
+) -> Result<HideResult, String> {
+    let hide_ptr = match remote_dlsym(pid, dl, offsets, handle, b"rust_hide_from_solist\0") {
+        Ok(ptr) if ptr != 0 => ptr,
+        _ => remote_dlsym(pid, dl, offsets, handle, b"hide_from_solist\0")?,
+    };
+    if hide_ptr == 0 {
+        return Err("dlsym(hide_from_solist) 返回 NULL".to_string());
+    }
+    let hide_status = call_target_function(pid, hide_ptr, &[handle], None)
+        .map_err(|e| format!("调用 hide_from_solist 失败: {}", e))? as i32;
+    let result_ptr = remote_dlsym(pid, dl, offsets, handle, b"rust_get_hide_result\0").or_else(|_| {
+        remote_dlsym(pid, dl, offsets, handle, b"get_hide_result\0")
+    })?;
+    if result_ptr == 0 {
+        return Err("dlsym(get_hide_result) 返回 NULL".to_string());
+    }
+    let result_addr = call_target_function(pid, result_ptr, &[], None)
+        .map_err(|e| format!("调用 get_hide_result 失败: {}", e))?;
+    if result_addr == 0 {
+        return Err("get_hide_result 返回 NULL".to_string());
+    }
+    let r = read_memory::<HideResult>(pid, result_addr)?;
+    log_hide_result(&r);
+    if hide_status != 1 || r.status != 1 {
+        return Err(format!(
+            "加载成功但隐藏失败: status={} stage={} error={}",
+            r.status,
+            r.stage,
+            HideResult::cstr(&r.error)
+        ));
+    }
+    Ok(r)
+}
+
 /// Debug 注入：根据模式选择性注入组件，用于隔离测试检测向量
 /// 返回 Option<RawFd>：有 socketpair 时返回 host_fd，否则 None
 pub(crate) fn inject_debug(
@@ -610,17 +696,16 @@ pub(crate) fn inject_debug(
         }
     }
 
-    // 附加到目标进程
     attach_to_process(pid)?;
+    let mut guard = InjectionGuard::new(pid, -1);
 
-    // ptrace-only: 只调用 malloc + free，不注入任何东西
     if mode == DebugInjectMode::PtraceOnly {
         let ptr =
             call_target_function(pid, offsets.malloc, &[64], None).map_err(|e| format!("调用 malloc 失败: {}", e))?;
         log_success!("malloc(64) = 0x{:x}", ptr);
         let _ = call_target_function(pid, offsets.free, &[ptr], None);
         log_success!("free(0x{:x}) 完成", ptr);
-
+        let _ = guard.into_fd();
         if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
             log_error!("分离目标进程失败: {}", e);
         } else {
@@ -629,15 +714,12 @@ pub(crate) fn inject_debug(
         return Ok(None);
     }
 
-    // memfd-only: 创建 memfd + 写入 SO 数据 + 关闭 fd，不 dlopen
-    // 隔离 memfd fd 暴露 vs dl_iterate_phdr 检测
     if mode == DebugInjectMode::MemfdOnly {
         let target_memfd = create_and_fill_memfd(pid, &offsets, EMPTY_SO, "empty.so")?;
         log_success!("memfd 创建并写入完成: target_fd={}", target_memfd);
-        // 立即关闭 memfd（不 dlopen），测试纯 memfd 创建+关闭是否被检测
         let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
         log_success!("memfd 已关闭");
-
+        let _ = guard.into_fd();
         if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
             log_error!("分离目标进程失败: {}", e);
         } else {
@@ -647,95 +729,46 @@ pub(crate) fn inject_debug(
     }
 
     let mut host_fd: Option<RawFd> = None;
-
-    // socketpair（fd-only / so+fd）
     if mode.needs_socketpair() {
         let (fd0, fd1) = create_socketpair_in_target(pid, &offsets)?;
         let extracted = extract_fd_from_target(pid, fd0)?;
-        // 关闭目标进程的 fd0
         let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
         log_success!("socketpair 创建成功: host_fd={}, target_fd1={}", extracted, fd1);
         host_fd = Some(extracted);
-
-        // fd-only 模式到此为止：也关闭目标进程的 fd1（只测试 fd 是否被探测）
+        guard.set_host_fd(extracted);
         if mode == DebugInjectMode::FdOnly {
-            // 保留 fd1 不关闭——检测工具会扫描 /proc/pid/fd
             log_info!("fd-only 模式: socketpair fd1={} 保留在目标进程中", fd1);
         }
     }
 
-    // dlopen SO（so-only / so-empty / so+fd）
     if mode.needs_dlopen() {
         let dl = dl_offsets.as_ref().unwrap();
-        let (so_data, label, hide_result_sym): (&[u8], &str, &[u8]) = if mode.use_empty_so() {
-            (EMPTY_SO, "empty.so", b"")
+        let (so_data, label): (&[u8], &str) = if mode.use_empty_so() {
+            (EMPTY_SO, "empty.so")
         } else {
             #[cfg(feature = "qbdi")]
             if mode.use_qbdi_helper_so() {
-                (QBDI_HELPER_SO, "qbdi_helper.so", b"rust_get_hide_result\0")
+                (QBDI_HELPER_SO, "qbdi_helper.so")
             } else {
-                (AGENT_SO, "agent.so", b"rust_get_hide_result\0")
+                (AGENT_SO, "agent.so")
             }
             #[cfg(not(feature = "qbdi"))]
             {
-                (AGENT_SO, "agent.so", b"rust_get_hide_result\0")
+                (AGENT_SO, "agent.so")
             }
         };
         let target_memfd = create_and_fill_memfd(pid, &offsets, so_data, label)?;
-        let handle = dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl, label)?;
-        // 关闭 memfd（SO 已加载，memfd 不再需要）
+        let handle = match dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl, label) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
+                return Err(e);
+            }
+        };
         let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
         log_success!("{} dlopen 完成", label);
-
-        // 读取 hide_soinfo 结果（仅非空 SO）
         if !mode.use_empty_so() && handle != 0 {
-            let sym_addr = call_target_function(pid, offsets.malloc, &[hide_result_sym.len()], None).ok();
-            if let Some(sym_addr) = sym_addr {
-                let _ = write_bytes(pid, sym_addr, hide_result_sym);
-                if let Ok(fn_ptr) = call_target_function(pid, dl.dlsym, &[handle, sym_addr], None) {
-                    let _ = call_target_function(pid, offsets.free, &[sym_addr], None);
-                    if fn_ptr != 0 {
-                        // 调用 rust_get_hide_result() → 返回 struct hide_result*
-                        if let Ok(result_ptr) = call_target_function(pid, fn_ptr, &[], None) {
-                            if result_ptr != 0 {
-                                if let Ok(r) = read_memory::<HideResult>(pid, result_ptr) {
-                                    let tp_str = HideResult::cstr(&r.target_path);
-                                    let hp_str = HideResult::cstr(&r.head_path);
-                                    if r.status == 1 {
-                                        log_success!("hide_soinfo: 成功隐藏 \"{}\"", tp_str);
-                                        log_info!(
-                                            "  next_offset=0x{:x}, scanned={}, syms={}",
-                                            r.next_offset,
-                                            r.entries_scanned,
-                                            r.sym_matched
-                                        );
-                                        log_info!("  head=\"{}\", target=0x{:x}", hp_str, r.target_ptr);
-                                    } else {
-                                        log_error!("hide_soinfo: 失败 (status={})", r.status);
-                                        let err_str = HideResult::cstr(&r.error);
-                                        if !err_str.is_empty() {
-                                            log_error!("  error: {}", err_str);
-                                        }
-                                        log_info!(
-                                            "  next_offset=0x{:x}, scanned={}, syms={}",
-                                            r.next_offset,
-                                            r.entries_scanned,
-                                            r.sym_matched
-                                        );
-                                        log_info!("  head=0x{:x}, head_path=\"{}\"", r.head_ptr, hp_str);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let sym_name =
-                            std::str::from_utf8(&hide_result_sym[..hide_result_sym.len() - 1]).unwrap_or("<invalid>");
-                        log_warn!("dlsym({}) 返回 NULL", sym_name);
-                    }
-                } else {
-                    let _ = call_target_function(pid, offsets.free, &[sym_addr], None);
-                }
-            }
+            invoke_hide_from_solist(pid, handle, &offsets, dl)?;
         }
     }
 
@@ -756,7 +789,7 @@ pub(crate) fn inject_debug(
         }
     }
 
-    // detach
+    guard.disarm();
     if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
         log_error!("分离目标进程失败: {}", e);
     } else {
@@ -794,6 +827,7 @@ fn find_data_dir_by_uid(uid: u32) -> Option<String> {
 }
 
 /// 使用 eBPF 监听 SO 加载并自动附加
+#[cfg(feature = "watch-so")]
 pub(crate) fn watch_and_inject(
     so_pattern: &str,
     timeout_secs: Option<u64>,
@@ -860,4 +894,13 @@ pub(crate) fn watch_and_inject(
         }
         None => Err("监听超时，未检测到匹配的 SO 加载".to_string()),
     }
+}
+
+#[cfg(not(feature = "watch-so"))]
+pub(crate) fn watch_and_inject(
+    _so_pattern: &str,
+    _timeout_secs: Option<u64>,
+    _string_overrides: &std::collections::HashMap<String, String>,
+) -> Result<RawFd, String> {
+    Err("当前 rustfrida 未启用 watch-so feature（需要 bpf-linker / ldmonitor eBPF）".to_string())
 }
