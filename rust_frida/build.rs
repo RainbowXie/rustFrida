@@ -4,9 +4,34 @@ use std::process::Command;
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let empty_so = manifest.join("../loader/build/empty.so");
+    println!("cargo::rerun-if-changed=../target/aarch64-linux-android/debug/libagent.so");
+    println!("cargo::rerun-if-changed=../target/aarch64-linux-android/release/libagent.so");
+    println!("cargo::rerun-if-changed=../loader/build/loader.bin");
     println!("cargo:rerun-if-changed=../loader/build/empty.so");
     println!("cargo:rerun-if-changed=../loader/empty_so.c");
     println!("cargo:rerun-if-changed=../loader/build_empty_so.py");
+
+    // enable qbdi feature 时 host 用 include_bytes! 嵌入 helper，路径必须由构建脚本回传。
+    if std::env::var_os("CARGO_FEATURE_QBDI").is_some() {
+        let target = std::env::var("TARGET").expect("TARGET not set");
+        let profile = std::env::var("PROFILE").expect("PROFILE not set");
+        let workspace_root = manifest
+            .parent()
+            .expect("../rust_frida must live under the workspace root");
+        let helper_path = workspace_root
+            .join("target")
+            .join(&target)
+            .join(if profile == "release" { "release" } else { "debug" })
+            .join("libqbdi_helper.so");
+        if !helper_path.exists() {
+            panic!(
+                "qbdi feature requires {}; build `cargo build -p qbdi-helper` first",
+                helper_path.display()
+            );
+        }
+        println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path.display());
+        println!("cargo:rerun-if-changed={}", helper_path.display());
+    }
 
     if !empty_so.exists() {
         let ndk = std::env::var("NDK_PATH")
