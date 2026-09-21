@@ -1,3 +1,5 @@
+include!("../build-support/compiler_rt.rs");
+
 fn main() {
     cc::Build::new()
         .include("../agent/src")
@@ -37,12 +39,16 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
     }
 
+    link_compiler_rt_builtins();
+
+    // 与 agent 一致：cdylib 只导出 Rust 侧 rust_* 包装，C 同名函数会被 localize。
     println!(
-        "cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,rust_get_hide_result,-u,hide_from_solist,--export-dynamic-symbol=get_hide_result,--export-dynamic-symbol=rust_get_hide_result,--export-dynamic-symbol=hide_from_solist"
+        "cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,rust_get_hide_result,-u,hide_from_solist,-u,rust_hide_from_solist,--export-dynamic-symbol=rust_get_hide_result,--export-dynamic-symbol=rust_hide_from_solist"
     );
     println!("cargo:rerun-if-changed=../agent/src/hide_soinfo.c");
     println!("cargo:rerun-if-changed=../agent/src/hide_soinfo.h");
     println!("cargo:rerun-if-changed=../agent/src/hide_linker.c");
     println!("cargo:rerun-if-changed=../agent/src/hide_txn.c");
     println!("cargo:rerun-if-changed={}", qbdi_archive.display());
+    println!("cargo:rerun-if-changed=../build-support/compiler_rt.rs");
 }

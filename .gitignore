@@ -9,3 +9,5 @@ tools/*_test.js
 tools/*_test.sh
 trace-decoder/target/
 host-tests/target/
+# 本地 agent 运行产物（含任务日志），不属于源码。
+/.pi/

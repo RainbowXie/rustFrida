@@ -98,8 +98,13 @@ cd "$repo"
 if [[ ! -f quickjs-hook/quickjs-src/quickjs.c ]]; then
   git submodule update --init --recursive quickjs-hook/quickjs-src
 fi
-if [[ ! -f loader/build/loader.bin ]]; then
+# loader.bin 仅在缺失时构建会因为源码改动被静默忽略；改成源码比产物新就重建。
+if [[ ! -f loader/build/loader.bin || loader/loader.c -nt loader/build/loader.bin ]]; then
   python3 loader/loader.py --ndk "$ndk" --api 33
+fi
+# 独立枚举探针：源码变更后必须重建，否则 probe 模式会跑到旧探针。
+if [[ ! -f loader/build/probe.so || loader/probe_so.c -nt loader/build/probe.so ]]; then
+  python3 loader/build_probe_so.py --ndk "$ndk" --api 33
 fi
 
 echo "== 构建 release 产物 =="
@@ -125,6 +130,22 @@ for artifact in "$host_bin" "$helper_so"; do
     exit 1
   fi
 done
+
+# cdylib 允许带未定义符号链接成功，缺陷会推迟到设备 dlopen 才暴露。
+# __clear_cache 由 compiler-rt builtins 提供，bionic 不导出，必须确认已静态链入。
+agent_so=$(dirname "$host_bin")/libagent.so
+if [[ -f "$agent_so" ]]; then
+  nm_tool=$(find "$toolchain/bin" -maxdepth 1 -name 'llvm-nm' | head -1)
+  if [[ -n "$nm_tool" ]]; then
+    for so in "$agent_so" "$helper_so"; do
+      if "$nm_tool" -D --undefined-only "$so" 2>/dev/null | grep -qw '__clear_cache'; then
+        echo "undefined __clear_cache in $so: it would fail at dlopen on device" >&2
+        echo "compiler-rt builtins were not linked; check build-support/compiler_rt.rs" >&2
+        exit 1
+      fi
+    done
+  fi
+fi
 
 package="rustfrida"
 staging=$(mktemp -d)

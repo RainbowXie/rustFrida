@@ -48,6 +48,7 @@ typedef struct {
     uint64_t solist_tail;
     uint64_t solist_add_soinfo;
     uint64_t solist_remove_soinfo;
+    uint64_t find_containing_library;
     uint64_t soinfo_get_path;
     uint64_t r_debug;
     uint64_t r_debug_tail;
@@ -57,6 +58,8 @@ typedef const char *(*get_path_fn)(void *);
 typedef void *(*get_head_fn)(void);
 typedef void (*remove_soinfo_fn)(void *);
 typedef void (*add_soinfo_fn)(void *);
+/* linker 内部用地址区间把任意地址反查回所属 soinfo，dlsym 也走同一条路径。 */
+typedef void *(*find_containing_fn)(const void *);
 
 struct link_map_entry {
     uint64_t l_addr;

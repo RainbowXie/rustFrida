@@ -123,7 +123,8 @@ fn parse_rust_fields(src: &str, struct_name: &str) -> HashMap<String, usize> {
             continue;
         }
         let (name, ty) = line.split_once(':').unwrap_or_else(|| panic!("bad Rust field: {line}"));
-        let name = name.trim();
+        // 拆分后字段带 pub(crate) 可见性限定，解析偏移时必须先剥掉。
+        let name = name.trim().strip_prefix("pub(crate) ").unwrap_or(name.trim()).trim();
         let (size, align) = rust_type_layout(ty.trim());
         offset = align_up(offset, align);
         if !name.starts_with('_') {
@@ -186,10 +187,11 @@ fn rust_injection_hide_result_matches_versioned_abi() {
 
 #[test]
 fn qbdi_helper_hide_result_matches_versioned_abi() {
-    let path = workspace_root().join("quickjs-hook/src/jsapi/hook_api/qbdi.rs");
+    // HideResult 随 qbdi 模块拆分移到了 mod.rs（类型定义集中处）。
+    let path = workspace_root().join("quickjs-hook/src/jsapi/hook_api/qbdi/mod.rs");
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let fields = parse_rust_fields(&src, RUST_STRUCT);
-    assert_contract(&fields, "qbdi.rs");
+    assert_contract(&fields, "qbdi/mod.rs");
 }
 
 #[test]

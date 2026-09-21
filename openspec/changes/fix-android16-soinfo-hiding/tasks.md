@@ -38,9 +38,18 @@
 
 - [x] 6.1 运行 host-tests、trace-decoder 测试、相关 crate 构建和新增 ABI/parser/ELF 门禁，并记录所有命令与结果
 - [ ] 6.2 在 Android 15 ARM64 设备依次验证 `ptrace-only`、`memfd-only`、`so-empty`、`so-only`、完整 attach 和 spawn，确认 agent 连接、目标存活和失败清理
+      （阻塞：本机无 Android 15 设备；现有设备为 A10/A13/A14/A16。需补设备或用 SDK-35 linker fixture 替代）
 - [x] 6.3 在 Pixel 6 `192.168.123.235:5555` Android 16 上执行同一矩阵，确认不再出现 PC 位于 `linker64`、LR 位于 rustFrida `wwb_so` 的加载异常
-- [ ] 6.4 使用独立枚举探针验证成功注入后目标库同时不出现在 `dl_iterate_phdr`/`soinfo` 和 `_r_debug.r_map` 中，不以 `HideResult` 自报成功替代外部证据
+- [x] 6.4 使用独立枚举探针验证成功注入后目标库同时不出现在 `dl_iterate_phdr`/`soinfo` 和 `_r_debug.r_map` 中，不以 `HideResult` 自报成功替代外部证据
+      （已实现 `loader/probe_so.c` + `--debug-inject probe`：DL 两条链各自枚举，排除探针自身。
+      正向：solist 356/0、r_map 356/0；反向：只摘 solist 不摘 r_map 时 `HideResult` 仍报成功，
+      而探针报 r_map 357/1 并让注入失败——证明外部证据能拆穿假成功。）
 - [ ] 6.5 对 attach 与 spawn 各执行重复运行和失败后重试，验证没有偶发时序依赖、Zygote patch 残留或 fd/暂停进程污染
+      （attach 部分已完成：`host-tests/scripts/android16-repeat-retry.sh` 同进程 3 次全过；
+      不存在 PID 失败后同一目标重试成功；每轮结束无 rustfrida 残留、目标非 T 状态。
+      spawn 部分阻塞：本机 Android 16 在 Zymbiote 阶段失败（boot heap 找不到 setArgV0 指针），
+      已用改动前 v0.1.0 二进制复现同样失败，确认 pre-existing 且与本次改动无关；
+      spawn 重复/重试验收需先解决 Zymbiote 兼容性，因此本项不勾选。）
 
 ## 7. 文档与审计收口
 

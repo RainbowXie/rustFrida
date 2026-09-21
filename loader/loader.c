@@ -3,7 +3,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
-// 定义字符串表结构体，与main.rs中的完全一致
+// 定义字符串表结构体，与 main.rs 中的完全一致
 typedef struct {
     uint64_t sym_name;
     uint32_t sym_name_len;
@@ -21,7 +21,7 @@ typedef struct {
     uint32_t output_path_len;
 } StringTable;
 
-// 定义与main.rs中相同的结构体（字段顺序必须完全一致）
+// 定义与 main.rs 中相同的结构体（字段顺序必须完全一致）
 typedef struct {
     uintptr_t malloc;      // 用于分配内存
     uintptr_t free;        // 用于释放内存
@@ -205,7 +205,7 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     ext_info.library_fd = memfd;
     ext_info.library_fd_offset = 0;
 
-    // 需要传非NULL文件名，否则 linker 返回主程序 handle
+    // 需要传非 NULL 文件名，否则 linker 返回主程序 handle
     char lib_name[10];
     lib_name[0] = 'a'; lib_name[1] = 'g'; lib_name[2] = 'e';
     lib_name[3] = 'n'; lib_name[4] = 't'; lib_name[5] = '.';
@@ -222,7 +222,8 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         return -5;
     }
 
-    /* 隐藏入口必须在摘链前用本次 handle 解析；摘除后公开 dlsym 已不可用。 */
+    /* 隐藏入口必须在摘链前用本次 handle 解析；摘除后公开 dlsym 已不可用。
+       cdylib 只导出 Rust 侧 rust_* 包装（C 同名函数被 localize），只认这一个名字。 */
     char hide_name[23];
     hide_name[0]='r'; hide_name[1]='u'; hide_name[2]='s'; hide_name[3]='t';
     hide_name[4]='_'; hide_name[5]='h'; hide_name[6]='i'; hide_name[7]='d';
@@ -231,14 +232,6 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     hide_name[16]='o'; hide_name[17]='l'; hide_name[18]='i'; hide_name[19]='s';
     hide_name[20]='t'; hide_name[21]='\0';
     hide_from_solist_t hide_fn = (hide_from_solist_t)dlsym(handle, hide_name);
-    if (!hide_fn) {
-        hide_name[0]='h'; hide_name[1]='i'; hide_name[2]='d'; hide_name[3]='e';
-        hide_name[4]='_'; hide_name[5]='f'; hide_name[6]='r'; hide_name[7]='o';
-        hide_name[8]='m'; hide_name[9]='_'; hide_name[10]='s'; hide_name[11]='o';
-        hide_name[12]='l'; hide_name[13]='i'; hide_name[14]='s'; hide_name[15]='t';
-        hide_name[16]='\0';
-        hide_fn = (hide_from_solist_t)dlsym(handle, hide_name);
-    }
     char result_name[22];
     result_name[0]='r'; result_name[1]='u'; result_name[2]='s'; result_name[3]='t';
     result_name[4]='_'; result_name[5]='g'; result_name[6]='e'; result_name[7]='t';

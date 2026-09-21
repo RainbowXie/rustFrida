@@ -42,8 +42,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-// hide_soinfo.c 中的调试结果函数（.init_array 构造函数填充）
-// 通过 Rust #[no_mangle] 重导出到动态符号表，供 host 端 dlsym 查询
+// hide_soinfo.c 的调试结果与隐藏入口。
+// 构造阶段只登记待隐藏，最终结果由 dlopen 返回后的 hide_from_solist 事务写入。
+// 通过 Rust #[no_mangle] 重导出到动态符号表，供 host 端 dlsym 查询。
 extern "C" {
     fn get_hide_result() -> *const c_void;
     fn hide_from_solist(handle: *mut c_void) -> i32;
@@ -59,7 +60,7 @@ pub extern "C" fn rust_hide_from_solist(handle: *mut c_void) -> i32 {
     unsafe { hide_from_solist(handle) }
 }
 
-// 定义我们自己的Result类型，错误统一为String
+// 定义我们自己的 Result 类型，错误统一为 String。
 type Result<T> = std::result::Result<T, String>;
 
 // StringTable 结构定义（需要和 main.rs 中的定义完全一致）
@@ -115,7 +116,7 @@ pub struct AgentArgs {
 
 #[no_mangle]
 pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
-    // 安装Rust panic hook（需要在最前面，捕获Rust层面的panic）
+    // 安装 Rust panic hook（需要在最前面，捕获 Rust 层面的 panic）
     install_panic_hook();
     install_crash_handlers();
 

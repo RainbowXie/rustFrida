@@ -129,6 +129,7 @@ int resolve_linker_syms(const char *path, uint64_t base, linker_syms_t *out) {
         { "__dl__ZL11solist_tail", &out->solist_tail },
         { "__dl__Z17solist_add_soinfoP6soinfo", &out->solist_add_soinfo },
         { "__dl__Z20solist_remove_soinfoP6soinfo", &out->solist_remove_soinfo },
+        { "__dl__Z23find_containing_libraryPKv", &out->find_containing_library },
         { "__dl__ZNK6soinfo12get_realpathEv", &out->soinfo_get_path },
         { "__dl__ZNK6soinfo7get_pathEv", &out->soinfo_get_path },
         { "__dl__r_debug", &out->r_debug },

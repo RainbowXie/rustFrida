@@ -11,4 +11,6 @@ mod empty_so;
 #[cfg(test)]
 mod hide_result_abi;
 #[cfg(test)]
+mod regression_guards;
+#[cfg(test)]
 mod soinfo_next;

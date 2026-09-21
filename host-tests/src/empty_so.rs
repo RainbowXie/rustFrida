@@ -58,11 +58,24 @@ fn constructor_must_not_call_solist_remove() {
 #[test]
 fn hide_identity_must_not_rely_only_on_handle_pointer() {
     let src = std::fs::read_to_string(workspace_join("agent/src/hide_txn.c")).unwrap();
-    assert!(src.contains("solist_get_head 实际返回 sonext") || src.contains("sonext 尾指针"),
-        "must not treat Android 16 solist_get_head as list head");
-    assert!(src.contains("dladdr(&g_identity_marker"), "must identify current library via dladdr");
-    assert!(src.contains("matches != 1"), "must reject ambiguous soinfo matches");
-    assert!(src.contains("path_is_self"), "must not match soinfo by opaque handle alone");
+    assert!(
+        src.contains("solist_get_head 实际返回 sonext") || src.contains("sonext 尾指针"),
+        "must not treat Android 16 solist_get_head as list head"
+    );
+    // 身份改用 linker 自己的地址区间反查：同名 memfd 不会再把历史节点算进来。
+    assert!(
+        src.contains("find_containing_library"),
+        "must resolve current library by address via find_containing_library"
+    );
+    assert!(
+        src.contains("&g_identity_marker"),
+        "must anchor the address lookup on this library's own marker"
+    );
+    // 按名字累计匹配正是被修掉的身份冲突来源，不能再出现。
+    assert!(
+        !src.contains("path_is_self"),
+        "must not fall back to name matching, which collides on repeated same-named memfd loads"
+    );
 }
 
 #[test]
@@ -70,10 +83,11 @@ fn hide_from_solist_is_exported_transaction() {
     let src = std::fs::read_to_string(workspace_join("agent/src/hide_soinfo.c")).unwrap();
     assert!(src.contains("int hide_from_solist(void *handle)"));
     assert!(src.contains("hide_prepare") && src.contains("hide_commit"));
+    // qbdi.rs 已按职责拆成子模块，改掉实现文件仍只允许有一个。
     for path in [
         "loader/loader.c",
         "rust_frida/src/injection.rs",
-        "quickjs-hook/src/jsapi/hook_api/qbdi.rs",
+        "quickjs-hook/src/jsapi/hook_api/qbdi/helper.rs",
     ] {
         let body = std::fs::read_to_string(workspace_join(path)).unwrap();
         assert!(body.contains("hide_from_solist"), "{path} must share hide_from_solist");
