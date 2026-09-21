@@ -1,26 +1,9 @@
-##windows
-#[target.aarch64-linux-android]
-#linker = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
-#ar = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-#
-#[build]
-#target = "aarch64-linux-android"
-#rustflags = ["-l","clang_rt.builtins-aarch64","-L","E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/lib64/clang/14.0.6/lib/baremetal"]
-#
-#[env]
-#BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/sysroot"
-#CC_aarch64-linux-android = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
-
-#linux
+# Android 交叉编译默认配置。
+# 不得写入机器专属绝对路径：NDK 通过 PATH 提供，例如
+#   export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
 [build]
 target = "aarch64-linux-android"
 
 [target.aarch64-linux-android]
-linker = "/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-ar = "/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-rustflags = ["-l","clang_rt.builtins-aarch64","-L","/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/14.0.6/lib/baremetal"]
-
-[env]
-CC_aarch64-linux-android = "/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-#CFLAGS_aarch64-linux-android = "--sysroot=/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
-BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
+linker = "aarch64-linux-android33-clang"
+ar = "llvm-ar"

@@ -19,9 +19,10 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_os == "android" && target_arch == "aarch64" {
+        // 不设默认 NDK：写死路径会在他人机器上静默解析到不存在的目录。
         let ndk_path = std::env::var("NDK_PATH")
             .or_else(|_| std::env::var("ANDROID_NDK_HOME"))
-            .unwrap_or_else(|_| "/home/wwb/Android/Sdk/ndk/25.0.8775105".to_string());
+            .expect("NDK_PATH or ANDROID_NDK_HOME required to link libc++ for aarch64 android");
         let cxx_lib_dir = std::path::PathBuf::from(&ndk_path)
             .join("toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android");
         let cxx_static = cxx_lib_dir.join("libc++_static.a");
