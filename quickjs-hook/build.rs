@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -58,14 +58,58 @@ fn main() {
         }
 
         // Android-specific flags
-        if env::var("TARGET").unwrap_or_default().contains("android") {
+        let target = env::var("TARGET").unwrap_or_default();
+        let is_android = target.contains("android");
+        if is_android {
             build.flag("-DANDROID");
         }
 
         build.compile("quickjs");
 
+        // 解析 Android 交叉编译所需 sysroot，防止 bindgen 读取宿主机 /usr/include 导致 __GLIBC_USE 报错。
+        let mut android_clang_args = Vec::new();
+        if is_android {
+            println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
+            println!("cargo:rerun-if-env-changed=ANDROID_NDK_ROOT");
+            println!("cargo:rerun-if-env-changed=NDK_PATH");
+            println!("cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS");
+
+            if env::var("BINDGEN_EXTRA_CLANG_ARGS").is_err() {
+                let ndk_opt = env::var("ANDROID_NDK_HOME")
+                    .or_else(|_| env::var("ANDROID_NDK_ROOT"))
+                    .or_else(|_| env::var("NDK_PATH"))
+                    .ok()
+                    .filter(|p| Path::new(p).join("source.properties").is_file())
+                    .or_else(|| {
+                        let path_var = env::var("PATH").unwrap_or_default();
+                        for dir in env::split_paths(&path_var) {
+                            if dir.join("aarch64-linux-android33-clang").is_file()
+                                || dir.join("aarch64-linux-android-clang").is_file()
+                            {
+                                let toolchain_prebuilt = dir.parent()?;
+                                let toolchains = toolchain_prebuilt.parent()?;
+                                let ndk = toolchains.parent()?;
+                                if ndk.join("source.properties").is_file() {
+                                    return Some(ndk.to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                        None
+                    });
+
+                if let Some(ndk_str) = ndk_opt {
+                    let sysroot = PathBuf::from(ndk_str)
+                        .join("toolchains/llvm/prebuilt/linux-x86_64/sysroot");
+                    if sysroot.is_dir() {
+                        android_clang_args.push("--target=aarch64-linux-android33".to_string());
+                        android_clang_args.push(format!("--sysroot={}", sysroot.display()));
+                    }
+                }
+            }
+        }
+
         // Generate bindings for QuickJS + wrapper
-        let bindings = bindgen::Builder::default()
+        let mut bindings_builder = bindgen::Builder::default()
             .header(quickjs_src.join("quickjs.h").to_string_lossy().to_string())
             .header(src_path.join("quickjs_wrapper.h").to_string_lossy().to_string())
             .clang_arg(format!("-I{}", quickjs_src.display()))
@@ -81,7 +125,13 @@ fn main() {
             .allowlist_function("qjs_.*")
             .allowlist_type("JS.*")
             .allowlist_var("JS_.*")
-            .use_core()
+            .use_core();
+
+        for arg in &android_clang_args {
+            bindings_builder = bindings_builder.clang_arg(arg);
+        }
+
+        let bindings = bindings_builder
             .generate()
             .expect("Unable to generate QuickJS bindings");
 
@@ -104,7 +154,43 @@ fn main() {
     }
 
     // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
-    let hook_bindings = bindgen::Builder::default()
+    let target = env::var("TARGET").unwrap_or_default();
+    let is_android = target.contains("android");
+    let mut hook_android_args = Vec::new();
+    if is_android && env::var("BINDGEN_EXTRA_CLANG_ARGS").is_err() {
+        let ndk_opt = env::var("ANDROID_NDK_HOME")
+            .or_else(|_| env::var("ANDROID_NDK_ROOT"))
+            .or_else(|_| env::var("NDK_PATH"))
+            .ok()
+            .filter(|p| Path::new(p).join("source.properties").is_file())
+            .or_else(|| {
+                let path_var = env::var("PATH").unwrap_or_default();
+                for dir in env::split_paths(&path_var) {
+                    if dir.join("aarch64-linux-android33-clang").is_file()
+                        || dir.join("aarch64-linux-android-clang").is_file()
+                    {
+                        let toolchain_prebuilt = dir.parent()?;
+                        let toolchains = toolchain_prebuilt.parent()?;
+                        let ndk = toolchains.parent()?;
+                        if ndk.join("source.properties").is_file() {
+                            return Some(ndk.to_string_lossy().to_string());
+                        }
+                    }
+                }
+                None
+            });
+
+        if let Some(ndk_str) = ndk_opt {
+            let sysroot = PathBuf::from(ndk_str)
+                .join("toolchains/llvm/prebuilt/linux-x86_64/sysroot");
+            if sysroot.is_dir() {
+                hook_android_args.push("--target=aarch64-linux-android33".to_string());
+                hook_android_args.push(format!("--sysroot={}", sysroot.display()));
+            }
+        }
+    }
+
+    let mut hook_builder = bindgen::Builder::default()
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_writer.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_relocator.h").to_string_lossy().to_string())
@@ -120,7 +206,13 @@ fn main() {
         .allowlist_type("Hook.*")
         .allowlist_type("Arm64.*")
         .allowlist_var("ARM64_.*")
-        .use_core()
+        .use_core();
+
+    for arg in &hook_android_args {
+        hook_builder = hook_builder.clang_arg(arg);
+    }
+
+    let hook_bindings = hook_builder
         .generate()
         .expect("Unable to generate hook_engine bindings");
 

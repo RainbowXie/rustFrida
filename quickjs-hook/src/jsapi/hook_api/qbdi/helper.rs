@@ -191,4 +191,3 @@ pub fn shutdown_qbdi_helper() {
         }
     }
 }
-

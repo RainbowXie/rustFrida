@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 static int fail_stage(int stage, int code, const char *msg) {
     g_hide_result.stage = stage;
@@ -65,36 +66,20 @@ struct write_journal {
 
 static struct link_map_entry *find_unique_link_map(
     uint64_t *r_map_ptr,
-    const char *path,
-    const char *self_path,
     uint64_t load_bias
 ) {
-    if (!r_map_ptr)
+    if (!r_map_ptr || !load_bias)
         return NULL;
     struct link_map_entry *lm = (struct link_map_entry *)(*r_map_ptr);
-    struct link_map_entry *matched = NULL;
-    int matches = 0;
     int count = 0;
     while (lm && count < 4096) {
         count++;
-        /* l_addr 就是 load bias，每次加载唯一；有它就不再看名字。 */
-        if (load_bias && lm->l_addr == load_bias)
+        /* l_addr 就是 load bias，每次加载唯一；严格按本次加载的 load bias 匹配，杜绝名称回退。 */
+        if (lm->l_addr == load_bias)
             return lm;
-        int by_name = 0;
-        if (lm->l_name) {
-            if (path && strcmp(lm->l_name, path) == 0)
-                by_name = 1;
-            else if (self_path && strcmp(lm->l_name, self_path) == 0)
-                by_name = 1;
-        }
-        /* 没有 load bias 时才回退到名字，且要求唯一，避免同名历史节点。 */
-        if (by_name) {
-            matches++;
-            matched = lm;
-        }
         lm = lm->l_next;
     }
-    return matches == 1 ? matched : NULL;
+    return NULL;
 }
 
 int hide_prepare(void *handle, struct hide_plan *plan) {
@@ -156,6 +141,9 @@ int hide_prepare(void *handle, struct hide_plan *plan) {
             self_path = self_info.dli_fname;
         plan->self_load_bias = (uint64_t)self_info.dli_fbase;
     }
+    (void)self_path;
+    if (!plan->self_load_bias)
+        return fail_stage(HIDE_STAGE_RESOLVE, -9, "self load bias not resolved");
 
     /* 同一进程可先后加载多个同名 memfd（路径字符串完全相同），按名字匹配会把
        历史节点也算进来。linker 自己是用地址区间反查节点的，这里调用同一个
@@ -208,7 +196,7 @@ int hide_prepare(void *handle, struct hide_plan *plan) {
 
     if (plan->syms.r_debug) {
         plan->r_map_ptr = (uint64_t *)(plan->syms.r_debug + 0x08);
-        plan->lm = find_unique_link_map(plan->r_map_ptr, path, self_path, plan->self_load_bias);
+        plan->lm = find_unique_link_map(plan->r_map_ptr, plan->self_load_bias);
         if (!plan->lm)
             return fail_stage(HIDE_STAGE_RESOLVE, -9, "unique link_map node not found");
     } else {
@@ -228,10 +216,23 @@ static void *current_solist_head(struct hide_plan *plan) {
     return plan->head;
 }
 
+static size_t get_page_size(void) {
+    static size_t cached_sz = 0;
+    if (cached_sz == 0) {
+        long sz = sysconf(_SC_PAGESIZE);
+        cached_sz = (sz > 0) ? (size_t)sz : 4096;
+    }
+    return cached_sz;
+}
+
+static uint64_t page_align_down(uint64_t addr) {
+    size_t sz = get_page_size();
+    return addr & ~(uint64_t)(sz - 1);
+}
+
 static int ptr_writable(void *p) {
     if (!p)
         return 0;
-    uint64_t page = (uint64_t)p & ~0xFFFULL;
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f)
         return 0;
@@ -246,7 +247,6 @@ static int ptr_writable(void *p) {
             ok = perms[1] == 'w';
             break;
         }
-        (void)page;
     }
     fclose(f);
     return ok;
@@ -259,17 +259,24 @@ static int store_ptr(void *slot, void *value) {
         *(void **)slot = value;
         return 0;
     }
-    /* linker soinfo 可能落在 RELRO 页；临时打开写权限才能摘链。 */
-    uint64_t page = (uint64_t)slot & ~0xFFFULL;
+    /* linker soinfo 可能落在 RELRO 页；临时打开写权限才能摘链。
+       使用动态页大小与掩码对齐，支持 Android 16 的 16 KB 页架构。 */
+    size_t page_size = get_page_size();
+    uint64_t page = page_align_down((uint64_t)slot);
     int orig = page_prot(slot);
     if (orig < 0)
         return -1;
-    if (mprotect((void *)page, 4096, orig | PROT_WRITE) != 0)
+    if (mprotect((void *)page, page_size, orig | PROT_WRITE) != 0)
         return -1;
+    void *old_val = *(void **)slot;
     *(void **)slot = value;
     /* 不恢复会让 RELRO 页永久可写，扩大攻击面且污染重复注入的初始状态。 */
-    if (mprotect((void *)page, 4096, orig) != 0)
+    if (mprotect((void *)page, page_size, orig) != 0) {
+        /* 权限恢复失败：趁页面此时仍处于可写状态，立即还原原值，并再次尝试恢复权限 */
+        *(void **)slot = old_val;
+        (void)mprotect((void *)page, page_size, orig);
         return -1;
+    }
     return 0;
 }
 
@@ -317,7 +324,7 @@ static uint64_t *solist_tail_slot(struct hide_plan *plan) {
     return plan->sonext_ptr;
 }
 
-/* 写入前记录旧值，失败时逆序写回。成功写入的每个槽位都必须在账上。 */
+/* 在尝试任何写入前先将槽位与旧值登记到日志账本，确保任何写入失败时 rollback 均在账上。 */
 static int journal_store(struct write_journal *j, void *slot, void *value) {
     if (!slot)
         return -1;
@@ -326,13 +333,15 @@ static int journal_store(struct write_journal *j, void *slot, void *value) {
         return -1;
     }
     void *old = *(void **)slot;
+    int idx = j->count;
+    j->items[idx].slot = slot;
+    j->items[idx].old_value = old;
+    j->count++;
+
     if (store_ptr(slot, value) != 0) {
         j->failed = 1;
         return -1;
     }
-    j->items[j->count].slot = slot;
-    j->items[j->count].old_value = old;
-    j->count++;
     return 0;
 }
 

@@ -93,6 +93,8 @@ toolchain="$ndk/toolchains/llvm/prebuilt/linux-x86_64"
 export PATH="$toolchain/bin:$PATH"
 export ANDROID_NDK_HOME="$ndk" ANDROID_NDK_ROOT="$ndk" NDK_PATH="$ndk"
 export CARGO_BUILD_TARGET="aarch64-linux-android"
+# bindgen 若缺少 sysroot 会读取宿主机 /usr/include，导致 __GLIBC_USE 未定义；显式绑定目标 sysroot。
+export BINDGEN_EXTRA_CLANG_ARGS="--target=aarch64-linux-android33 --sysroot=$toolchain/sysroot"
 
 cd "$repo"
 if [[ ! -f quickjs-hook/quickjs-src/quickjs.c ]]; then

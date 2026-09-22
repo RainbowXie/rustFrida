@@ -106,17 +106,38 @@ fn hide_transaction_rolls_back_and_restores_protection() {
     assert!(src.contains("write_journal"), "dual-chain writes must be journaled");
     assert!(src.contains("journal_rollback"), "failures must roll back written slots");
     assert!(src.contains("page_prot"), "must read the page's original protection");
-    // 恢复必须发生在写完之后，否则 RELRO 页会永久可写。
+    // 支持 Android 16 的 16 KB 页架构：不能硬编码 4096。
+    assert!(
+        src.contains("sysconf(_sc_pagesize)") || src.contains("get_page_size"),
+        "must dynamically query page size via sysconf(_SC_PAGESIZE)"
+    );
+    // 恢复必须发生在写完之后，且失败时必须有重试恢复。
     let store = src
         .split("static int store_ptr")
         .nth(1)
         .expect("store_ptr missing");
     let store = store.split("static int page_prot").next().unwrap();
-    assert_eq!(
-        store.matches("mprotect").count(),
-        2,
+    assert!(
+        store.matches("mprotect").count() >= 2,
         "store_ptr must open write access and restore the original protection"
     );
+}
+
+/// 纯逻辑验证：4 KB 与 16 KB 架构下的页对齐掩码计算必须正确。
+#[test]
+fn page_alignment_logic_supports_4k_and_16k() {
+    fn align_down(addr: u64, page_size: usize) -> u64 {
+        addr & !(page_size as u64 - 1)
+    }
+
+    // 4 KB 对齐
+    assert_eq!(align_down(0x7b65db66c0, 4096), 0x7b65db6000);
+    assert_eq!(align_down(0x7b65db6000, 4096), 0x7b65db6000);
+
+    // 16 KB 对齐 (0x4000)
+    assert_eq!(align_down(0x7b65db66c0, 16384), 0x7b65db4000);
+    assert_eq!(align_down(0x7b65db4000, 16384), 0x7b65db4000);
+    assert_eq!(align_down(0x7b65db7fff, 16384), 0x7b65db4000);
 }
 
 /// QBDI helper 隐藏失败必须让加载失败，不能继续发布 HELPER_API。

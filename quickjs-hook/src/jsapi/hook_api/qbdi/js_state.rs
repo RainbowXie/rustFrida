@@ -328,4 +328,3 @@ pub(crate) unsafe extern "C" fn js_qbdi_shutdown(
     shutdown_qbdi_helper();
     JSValue::bool(true).raw()
 }
-

@@ -92,4 +92,3 @@ pub(crate) unsafe fn value_or_null(ctx: *mut ffi::JSContext, rc: i32, value: u64
         JSValue::null().raw()
     }
 }
-

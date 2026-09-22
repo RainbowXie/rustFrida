@@ -240,4 +240,3 @@ js_bool_method!(js_qbdi_run, 3, |ctx, argc, argv| {
     };
     bool_from_rc((api.vm_run)(handle, start, stop))
 });
-
