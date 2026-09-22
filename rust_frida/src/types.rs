@@ -17,7 +17,7 @@ extern "C" {
 /// 定义需要获取偏移的函数列表
 macro_rules! define_libc_functions {
     ($($name:ident),*) => {
-        #[derive(Debug, Default)]
+        #[derive(Debug, Default, Clone, Copy)]
         pub(crate) struct LibcOffsets {
             $(pub(crate) $name: usize),*
         }
@@ -47,7 +47,7 @@ macro_rules! define_libc_functions {
 
 macro_rules! define_dl_functions {
     ($($name:ident),*) => {
-        #[derive(Debug, Default)]
+        #[derive(Debug, Default, Clone, Copy)]
         pub(crate) struct DlOffsets {
             $(pub(crate) $name: usize),*
         }

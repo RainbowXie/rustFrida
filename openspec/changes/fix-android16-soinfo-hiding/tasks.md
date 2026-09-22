@@ -49,9 +49,7 @@
       正向：solist 356/0、r_map 356/0；反向：只摘 solist 不摘 r_map 时 `HideResult` 仍报成功，
       而探针报 r_map 357/1 并让注入失败——证明外部证据能拆穿假成功。）
 - [ ] 6.5 对 attach 与 spawn 各执行重复运行和失败后重试，验证没有偶发时序依赖、Zygote patch 残留或 fd/暂停进程污染
-      （attach 部分已完成：`host-tests/scripts/android16-repeat-retry.sh` 同进程连续 3 次注入全过；
-      真实目标在故障注入前后 /proc/<pid>/fd 比对恒定为 185，无 fd 泄漏；TracerPid 为 0、目标无暂停态；
-      不存在 PID 失败后同一目标重试成功。
+      （attach 部分已验证：`host-tests/scripts/android16-repeat-retry.sh` 真机全绿——同进程连续 3 次注入成功；attach_done / memfd_created / dlopen_done / hide_partial / socketpair_created 五个故障阶段各命中一次真实故障（错误串 FAULT@<stage>、退出码非 0）；每次故障与成功后均断言目标 fd 链接目标集合相对零注入噪声基线无新增、无 wwb_so memfd 残留、无 rustfrida 进程残留、目标 state 非 T/t、TracerPid=0；全部故障后同一 PID 重试注入成功。fd 判定用噪声基线差分而非计数严格相等：实测 Settings 零注入下自身 fd churn（GC/reopen）导致计数波动，严格相等必误报。
       spawn 部分阻塞：本机 Android 16 在 Zymbiote 阶段失败（boot heap 找不到 setArgV0 指针），
       已用改动前 v0.1.0 二进制复现同样失败，确认 pre-existing 且与本次改动无关；
       spawn 重复/重试验收需先解决 Zymbiote 兼容性，因此本项不勾选。）
@@ -59,5 +57,5 @@
 ## 7. 文档与审计收口
 
 - [x] 7.1 更新 `agent/src/hide_soinfo.md` 和 README，说明加载后显式隐藏协议、Android 15/16 已验证范围、`wwb_so` 归属和 debug 模式分层含义
-- [ ] 7.2 执行代码审查、前提反证与收据审计，重点验证没有通过删除/禁用 `hide_from_solist`、静默跳过隐藏或伪造空 SO 来使测试通过
-- [ ] 7.3 提交实现前运行 GitNexus 变更影响分析和循环检查，并确认最终 Git 提交只包含本 change 的代码、测试和文档
+- [x] 7.2 执行代码审查、前提反证与收据审计，重点验证没有通过删除/禁用 `hide_from_solist`、静默跳过隐藏或伪造空 SO 来使测试通过
+- [x] 7.3 提交实现前运行 GitNexus 变更影响分析和循环检查，并确认最终 Git 提交只包含本 change 的代码、测试和文档

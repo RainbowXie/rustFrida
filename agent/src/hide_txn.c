@@ -216,18 +216,23 @@ static void *current_solist_head(struct hide_plan *plan) {
     return plan->head;
 }
 
-static size_t get_page_size(void) {
+/* 返回 0 成功，-1 失败。
+ * 页大小必须是正数、2 的幂且在合理范围，否则视为未知，绝不猜 4096：
+ * 在 16 KB 页设备上猜错会让 mprotect 操作错误范围或直接失败。 */
+static int get_page_size(size_t *out) {
     static size_t cached_sz = 0;
     if (cached_sz == 0) {
         long sz = sysconf(_SC_PAGESIZE);
-        cached_sz = (sz > 0) ? (size_t)sz : 4096;
+        if (sz <= 0 || sz > (1 << 20) || ((size_t)sz & ((size_t)sz - 1)) != 0)
+            return -1;
+        cached_sz = (size_t)sz;
     }
-    return cached_sz;
+    *out = cached_sz;
+    return 0;
 }
 
-static uint64_t page_align_down(uint64_t addr) {
-    size_t sz = get_page_size();
-    return addr & ~(uint64_t)(sz - 1);
+static uint64_t page_align_down(uint64_t addr, size_t page_size) {
+    return addr & ~(uint64_t)(page_size - 1);
 }
 
 static int ptr_writable(void *p) {
@@ -261,8 +266,10 @@ static int store_ptr(void *slot, void *value) {
     }
     /* linker soinfo 可能落在 RELRO 页；临时打开写权限才能摘链。
        使用动态页大小与掩码对齐，支持 Android 16 的 16 KB 页架构。 */
-    size_t page_size = get_page_size();
-    uint64_t page = page_align_down((uint64_t)slot);
+    size_t page_size;
+    if (get_page_size(&page_size) != 0)
+        return -1;
+    uint64_t page = page_align_down((uint64_t)slot, page_size);
     int orig = page_prot(slot);
     if (orig < 0)
         return -1;
@@ -423,6 +430,15 @@ int hide_commit(struct hide_plan *plan) {
         return fail_stage(HIDE_STAGE_WRITE_SOINFO, -10, "soinfo still visible after remove; rolled back");
     }
     g_hide_result.soinfo_state = CHAIN_HIDDEN;
+
+    /* 测试故障注入：soinfo 摘除成功、link_map 尚未写入时强制失败，
+       用来验证部分写入状态能被完整回滚。 */
+    if (g_hide_fault_stage == FAULT_STAGE_HIDE_PARTIAL) {
+        journal_rollback(&journal);
+        g_hide_result.soinfo_state = CHAIN_ROLLED_BACK;
+        g_hide_result.wrote = HIDE_WROTE_NONE;
+        return fail_stage(HIDE_STAGE_WRITE_LINKMAP, -11, "FAULT@hide_partial: injected");
+    }
 
     g_hide_result.stage = HIDE_STAGE_WRITE_LINKMAP;
     if (unlink_link_map(plan, &journal) != 0) {

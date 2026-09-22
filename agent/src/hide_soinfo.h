@@ -87,6 +87,16 @@ struct hide_plan {
 extern struct hide_result g_hide_result;
 extern char g_identity_marker;
 extern int g_hide_pending;
+/* 测试故障注入：非零值会让 hide_commit 在指定阶段中途失败。
+   仅用于验证故障路径的清理与回滚；生产流程必须保持 0。 */
+extern int g_hide_fault_stage;
+
+/* 设置故障注入阶段；返回目标进程内的函数地址供 host 经 ptrace 远程调用。 */
+__attribute__((visibility("default"))) void set_hide_fault_stage(int stage);
+
+/* g_hide_fault_stage 的合法取值；仅测试用，生产环境保持 0。 */
+#define FAULT_STAGE_NONE 0
+#define FAULT_STAGE_HIDE_PARTIAL 1
 
 int find_linker64(uint64_t *base, char *path, size_t path_size);
 uint64_t compute_load_bias(uint64_t base);

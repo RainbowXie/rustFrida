@@ -1,6 +1,7 @@
 //! 注入模块入口：提供生产注入流程、Debug 分层注入与独立枚举探针。
 
 mod guard;
+mod fault;
 mod normal;
 mod probe;
 mod remote;
@@ -174,6 +175,23 @@ fn invoke_hide_from_solist(
     offsets: &LibcOffsets,
     dl: &DlOffsets,
 ) -> Result<HideResult, String> {
+    // 故障注入：把阶段写入目标进程内的 g_hide_fault_stage，
+    // 让 hide 事务在 soinfo 摘除后、link_map 写入前失败，
+    // 用来验证部分写入能被完整回滚（见 agent/src/hide_txn.c）。
+    if fault::wants_stage(fault::FAULT_HIDE_PARTIAL) {
+        let setter_ptr = remote_dlsym(pid, dl, offsets, handle, b"rust_set_hide_fault_stage\0")?;
+        if setter_ptr == 0 {
+            return Err("dlsym(rust_set_hide_fault_stage) 返回 NULL".to_string());
+        }
+        call_target_function(
+            pid,
+            setter_ptr,
+            &[fault::FAULT_STAGE_HIDE_PARTIAL as usize],
+            None,
+        )
+        .map_err(|e| format!("调用 rust_set_hide_fault_stage 失败: {}", e))?;
+    }
+
     // cdylib 只导出 Rust 侧的 rust_* 包装（C 同名函数被 localize）。
     // 只认这一个名字：回退到别名会把“导出丢了”掩盖成“换了个符号”。
     let hide_ptr = remote_dlsym(pid, dl, offsets, handle, b"rust_hide_from_solist\0")?;
@@ -243,6 +261,9 @@ pub(crate) fn inject_debug(
 
     attach_to_process(pid)?;
     let mut guard = InjectionGuard::new(pid, -1);
+    guard.set_offsets(&offsets);
+    // 故障注入点：attach 之后、资源获取之前。
+    fault::maybe_fail(fault::FAULT_ATTACH_DONE)?;
 
     if mode == DebugInjectMode::PtraceOnly {
         let ptr =
@@ -261,8 +282,12 @@ pub(crate) fn inject_debug(
 
     if mode == DebugInjectMode::MemfdOnly {
         let target_memfd = create_and_fill_memfd(pid, &offsets, EMPTY_SO, "empty.so")?;
+        guard.own_target_fd(target_memfd);
+        // 故障注入点：memfd 已创建但尚未关闭。
+        fault::maybe_fail(fault::FAULT_MEMFD_CREATED)?;
         log_success!("memfd 创建并写入完成: target_fd={}", target_memfd);
         let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
+        guard.release_target_fd(target_memfd);
         log_success!("memfd 已关闭");
         let _ = guard.into_fd();
         if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
@@ -276,8 +301,14 @@ pub(crate) fn inject_debug(
     let mut host_fd: Option<RawFd> = None;
     if mode.needs_socketpair() {
         let (fd0, fd1) = create_socketpair_in_target(pid, &offsets)?;
+        // 目标 fd 立即入账：后续任一失败分支都由 guard 补偿关闭。
+        guard.own_target_fd(fd0);
+        guard.own_target_fd(fd1);
+        // 故障注入点：socketpair 已创建但尚未提取。
+        fault::maybe_fail(fault::FAULT_SOCKETPAIR_CREATED)?;
         let extracted = extract_fd_from_target(pid, fd0)?;
         let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
+        guard.release_target_fd(fd0);
         log_success!("socketpair 创建成功: host_fd={}, target_fd1={}", extracted, fd1);
         host_fd = Some(extracted);
         guard.set_host_fd(extracted);
@@ -303,14 +334,26 @@ pub(crate) fn inject_debug(
             }
         };
         let target_memfd = create_and_fill_memfd(pid, &offsets, so_data, label)?;
+        guard.own_target_fd(target_memfd);
+        // 故障注入点：memfd 已创建并入账但尚未 dlopen/关闭。
+        // 覆盖 needs_dlopen 分支，使真实目标的 memfd 泄漏清理可被验证。
+        if let Err(e) = fault::maybe_fail(fault::FAULT_MEMFD_CREATED) {
+            return Err(e);
+        }
         let handle = match dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl, label) {
             Ok(h) => h,
             Err(e) => {
                 let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
+                guard.release_target_fd(target_memfd);
                 return Err(e);
             }
         };
+        // 故障注入点：dlopen 成功后、隐藏之前。
+        if let Err(e) = fault::maybe_fail(fault::FAULT_DLOPEN_DONE) {
+            return Err(e);
+        }
         let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
+        guard.release_target_fd(target_memfd);
         log_success!("{} dlopen 完成", label);
         if !mode.use_empty_so() && handle != 0 {
             invoke_hide_from_solist(pid, handle, &offsets, dl)?;

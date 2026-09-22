@@ -48,6 +48,7 @@ use std::time::Duration;
 extern "C" {
     fn get_hide_result() -> *const c_void;
     fn hide_from_solist(handle: *mut c_void) -> i32;
+    fn set_hide_fault_stage(stage: i32);
 }
 
 #[no_mangle]
@@ -58,6 +59,12 @@ pub extern "C" fn rust_get_hide_result() -> *const c_void {
 #[no_mangle]
 pub extern "C" fn rust_hide_from_solist(handle: *mut c_void) -> i32 {
     unsafe { hide_from_solist(handle) }
+}
+
+/// 测试专用：设置隐藏事务故障注入阶段，供 host 在注入 hide 前触发部分写入。
+#[no_mangle]
+pub extern "C" fn rust_set_hide_fault_stage(stage: i32) {
+    unsafe { set_hide_fault_stage(stage) }
 }
 
 // 定义我们自己的 Result 类型，错误统一为 String。

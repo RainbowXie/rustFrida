@@ -101,12 +101,27 @@ pub(crate) fn inject_to_process(
     }
 
     attach_to_process(pid)?;
+    // 故障注入点：attach 之后、资源获取之前。
+    if let Err(e) = super::fault::maybe_fail(super::fault::FAULT_ATTACH_DONE) {
+        return Err(e);
+    }
+
+    let mut guard = InjectionGuard::new(pid, -1);
 
     let (fd0, fd1) = create_socketpair_in_target(pid, &offsets)?;
+    // 目标 fd 立即入账：后续任一失败分支都由 guard 补偿关闭。
+    guard.set_offsets(&offsets);
+    guard.own_target_fd(fd0);
+    guard.own_target_fd(fd1);
+    // 故障注入点：socketpair 创建后、提取 host_fd 之前。
+    if let Err(e) = super::fault::maybe_fail(super::fault::FAULT_SOCKETPAIR_CREATED) {
+        return Err(e);
+    }
     let host_fd = extract_fd_from_target(pid, fd0)?;
-    let guard = InjectionGuard::new(pid, host_fd);
+    guard.set_host_fd(host_fd);
 
     let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
+    guard.release_target_fd(fd0);
     log_verbose!("目标进程 fd0={} 已关闭，fd1={} 保留给 agent", fd0, fd1);
 
     log_verbose!("开始分配内存");
@@ -121,9 +136,21 @@ pub(crate) fn inject_to_process(
         agent_memfd: -1,
     };
     let agent_args_addr = alloc_and_write_struct(pid, offsets.malloc, &agent_args, "AgentArgs")?;
+    // 故障注入点：AgentArgs 写入后、shellcode 执行之前。
+    if let Err(e) = super::fault::maybe_fail(super::fault::FAULT_MEMFD_CREATED) {
+        return Err(e);
+    }
 
+    // 页大小必须是正数、2 的幂且在合理范围；不能假设 4096：
+    // 在 16 KB 页设备上猜错会让 mmap/munmap 操作错误范围。
     let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page_size = if page_size_raw > 0 { page_size_raw as usize } else { 4096 };
+    if page_size_raw <= 0 || page_size_raw > (1 << 20) {
+        return Err(format!("sysconf(_SC_PAGESIZE) 返回非法值: {}", page_size_raw));
+    }
+    let page_size = page_size_raw as usize;
+    if (page_size & (page_size - 1)) != 0 {
+        return Err(format!("页大小 {} 不是 2 的幂", page_size));
+    }
     let shellcode_len = ((SHELLCODE.len() + page_size - 1) / page_size) * page_size;
 
     let mmap_prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;

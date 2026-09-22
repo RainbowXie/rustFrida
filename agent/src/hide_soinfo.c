@@ -13,6 +13,12 @@
 struct hide_result g_hide_result = { .version = HIDE_RESULT_VERSION };
 char g_identity_marker = 1;
 int g_hide_pending = 0;
+int g_hide_fault_stage = 0;
+
+__attribute__((visibility("default")))
+void set_hide_fault_stage(int stage) {
+    g_hide_fault_stage = stage;
+}
 
 __attribute__((visibility("default")))
 struct hide_result *get_hide_result(void) {

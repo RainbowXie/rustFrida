@@ -112,7 +112,11 @@ pub(crate) struct AndroidDlextinfo {
     pub library_namespace: u64, // 0
 }
 
-/// 在目标进程中创建 memfd 并从 host 写入 SO 数据
+/// 在目标进程中创建 memfd 并从 host 写入 SO 数据。
+///
+/// target_memfd 在目标进程内；提取或写入失败时必须在本函数内补偿关闭，
+/// 否则调用者拿不到 fd 值，目标进程会永久泄漏一个描述符。
+/// 成功时显式转移所有权：调用者负责在 dlopen 之后关闭它。
 pub(crate) fn create_and_fill_memfd(
     pid: i32,
     offsets: &LibcOffsets,
@@ -120,7 +124,14 @@ pub(crate) fn create_and_fill_memfd(
     label: &str,
 ) -> Result<i32, String> {
     let target_memfd = create_memfd_in_target(pid, offsets)?;
-    let host_memfd = extract_fd_from_target(pid, target_memfd)?;
+    let host_memfd = match extract_fd_from_target(pid, target_memfd) {
+        Ok(h) => h,
+        Err(e) => {
+            // 提取失败：调用者拿不到 target_memfd，只能就地补偿关闭。
+            let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
+            return Err(e);
+        }
+    };
     log_verbose!("已提取目标 memfd: target_fd={} → host_fd={}", target_memfd, host_memfd);
 
     let mut written = 0usize;
@@ -140,6 +151,8 @@ pub(crate) fn create_and_fill_memfd(
                 continue;
             }
             unsafe { close(host_memfd) };
+            // 写入失败同样要补偿目标侧 fd。
+            let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
             return Err(format!("写入 {} 到 memfd 失败: {}", label, err));
         }
     }

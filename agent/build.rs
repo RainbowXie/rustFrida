@@ -15,9 +15,9 @@ fn main() -> anyhow::Result<()> {
         .file("src/hide_txn.c")
         .compile("hide_soinfo");
 
-    // cdylib 只导出 Rust 侧 #[no_mangle] 的 rust_* 包装，C 同名函数会被 localize。
-    // -u 防止这三个符号被 gc-sections 丢掉；host 侧只按 rust_* 查找。
-    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,hide_from_solist,-u,rust_hide_from_solist,--export-dynamic-symbol=rust_get_hide_result,--export-dynamic-symbol=rust_hide_from_solist");
+    // cdylib 只导出 Rust 侧 rust_* 包装，C 同名函数会被 localize。
+    // -u 防止隐藏事务与故障注入入口被 gc-sections 丢掉；host 侧只按 rust_* 查找。
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,hide_from_solist,-u,set_hide_fault_stage,-u,rust_hide_from_solist,-u,rust_set_hide_fault_stage,--export-dynamic-symbol=rust_get_hide_result,--export-dynamic-symbol=rust_hide_from_solist,--export-dynamic-symbol=rust_set_hide_fault_stage");
 
     link_compiler_rt_builtins();
 
