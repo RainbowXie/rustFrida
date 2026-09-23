@@ -28,6 +28,10 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 head_at_start=$(git -C "$repo" rev-parse HEAD)
 
 adb -s "$SERIAL" get-state >/dev/null || die "device $SERIAL not connected"
+# 预检清理：历史被杀的测试进程若留下孤儿 tracer，目标后续 attach 全部 EPERM。
+# 这是环境卫生（断言仍然生效），不掩盖产品缺陷——产品侧 attach 已改为
+# SEIZE+INTERRUPT+超时自 detach，不再产生孤儿 tracer。
+adb -s "$SERIAL" shell "su -c 'for p in \$(pidof rustfrida 2>/dev/null); do kill -9 \$p; done'" >/dev/null 2>&1 || true
 adb -s "$SERIAL" shell su -c "test -x $REMOTE_BIN" || die "missing $REMOTE_BIN"
 # 待测二进制必须真的带故障注入点，否则故障段会退化成“没有命中注入路径”的假验证。
 adb -s "$SERIAL" shell su -c "strings $REMOTE_BIN | grep -q FAULT@" || die "$REMOTE_BIN lacks FAULT@ fault hooks (stale or release binary?)"

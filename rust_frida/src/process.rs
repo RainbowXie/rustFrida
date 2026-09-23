@@ -70,26 +70,72 @@ fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     let target_pid = Pid::from_raw(pid);
 
-    // 尝试附加到目标进程
-    match ptrace::attach(target_pid) {
-        Ok(_) => {
-            log_success!("成功附加到进程 {}，等待 SIGSTOP...", pid);
-            match waitpid(target_pid, None) {
-                Ok(WaitStatus::Stopped(_, _)) => {
-                    log_success!("进程已停止，可以操作寄存器");
-                    Ok(())
+    // PTRACE_SEIZE + INTERRUPT 取代 PTRACE_ATTACH + SIGSTOP。
+    // 为什么：ATTACH 注入的 SIGSTOP 在反复 attach/detach 后会累积成 pending
+    // group-stop（实测 SigPnd=0x40000），后续 attach 的 waitpid 永久等不到新的
+    // stop 通知而挂死；rustfrida 被外层 timeout 杀掉后又留下孤儿 tracer，
+    // 目标后续 attach 全部 EPERM。SEIZE 不注入任何信号，INTERRUPT 产生
+    // PTRACE_EVENT_STOP，无信号残留。
+    if let Err(errno) = ptrace_request(PTRACE_SEIZE, target_pid) {
+        return Err(attach_errmsg(errno));
+    }
+    if let Err(errno) = ptrace_request(PTRACE_INTERRUPT, target_pid) {
+        let _ = ptrace::detach(target_pid, None);
+        return Err(attach_errmsg(errno));
+    }
+    log_success!("成功附加到进程 {}，等待 PTRACE_EVENT_STOP...", pid);
+
+    // waitpid 必须带超时：挂死时自行 detach，绝不把 rustfrida 留成孤儿 tracer
+    // （孤儿 tracer 会让目标后续所有 attach 失败，违反失败后可恢复）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match waitpid(target_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = ptrace::detach(target_pid, None);
+                    return Err("等待 PTRACE_EVENT_STOP 超时（已自行 detach，不留孤儿 tracer）".to_string());
                 }
-                other => Err(format!("waitpid 状态异常: {:?}", other)),
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Ok(WaitStatus::Stopped(_, _)) | Ok(WaitStatus::PtraceEvent(_, _, _)) => {
+                log_success!("进程已停止，可以操作寄存器");
+                return Ok(());
+            }
+            other => {
+                let _ = ptrace::detach(target_pid, None);
+                return Err(format!("waitpid 状态异常: {:?}", other));
             }
         }
-        Err(errno) => {
-            let err_msg = match errno {
-                Errno::EPERM => "权限不足，请使用root权限运行",
-                Errno::ESRCH => "目标进程不存在",
-                _ => "附加失败，未知错误",
-            };
-            Err(err_msg.to_string())
-        }
+    }
+}
+
+fn attach_errmsg(errno: Errno) -> String {
+    match errno {
+        Errno::EPERM => "权限不足，请使用root权限运行".to_string(),
+        Errno::ESRCH => "目标进程不存在".to_string(),
+        _ => "附加失败，未知错误".to_string(),
+    }
+}
+
+// nix 只在 target_os=linux 暴露 seize/interrupt（android 被 cfg 排除），
+// 但 bionic 的 ptrace(2) 完全支持这两个请求。直接封装同一系统调用，
+// 避免退回注入 SIGSTOP 的 ATTACH 路径（SIGSTOP 残留会累积挂死后续 attach）。
+const PTRACE_SEIZE: libc::c_int = 0x4206;
+const PTRACE_INTERRUPT: libc::c_int = 0x4207;
+
+fn ptrace_request(request: libc::c_int, pid: Pid) -> Result<(), Errno> {
+    let ret = unsafe {
+        libc::ptrace(
+            request,
+            pid.as_raw(),
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    if ret == -1 {
+        Err(Errno::last())
+    } else {
+        Ok(())
     }
 }
 
