@@ -9,6 +9,10 @@ default = ["quickjs"]
 frida-gum = ["dep:frida-gum"]
 qbdi = ["quickjs-hook?/qbdi"]
 quickjs = ["dep:quickjs-hook"]
+# 测试专用故障注入（HIDE_FAULT_INJECTION + rust_set_hide_fault_stage 导出）。
+# 与 rust_frida 的同名 feature 联动；发布构建不得启用。
+# 为什么门控：发布产物若携带故障注入入口，外部可令隐藏事务部分写入后回滚。
+fault-injection = []
 
 [dependencies]
 frida-gum = { path = "../frida-gum", features = [

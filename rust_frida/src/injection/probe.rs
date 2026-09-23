@@ -105,6 +105,9 @@ pub(crate) fn resolve_r_debug_addr(pid: i32) -> Result<usize, String> {
 /// 这是独立证据：探针不引用 hide 代码，走的是 bionic 公开 API 与调试器链。
 /// 若探针在两条链上均看不到 wwb_so，说明“不在链上”是外部可观测事实，
 /// 而不是 HideResult 自报。
+///
+/// 探针自身也叫 wwb_so（同一个 memfd 名），所以：读完结果必须自卸（dlclose），
+/// 否则下一次探测会把本次探针当成残留库，双链匹配数永远 >= 1。
 pub(crate) fn run_independent_probe(
     pid: i32,
     offsets: &LibcOffsets,
@@ -120,6 +123,21 @@ pub(crate) fn run_independent_probe(
     };
     let _ = call_target_function(pid, offsets.close, &[memfd as usize], None);
 
+    let outcome = probe_with_handle(pid, offsets, dl, handle);
+    // 无论读取成败都自卸探针：测量工具不能把自己留在枚举结果里。
+    if let Err(e) = call_target_function(pid, dl.dlclose, &[handle], None) {
+        log_error!("探针 dlclose 失败: {}", e);
+    }
+    outcome
+}
+
+/// 已加载探针后的测量流程；handle 的卸载由调用方负责。
+fn probe_with_handle(
+    pid: i32,
+    offsets: &LibcOffsets,
+    dl: &DlOffsets,
+    handle: usize,
+) -> Result<ProbeResult, String> {
     // 结果缓冲区分配在目标进程，探针填完由 host 读回。
     let size = size_of::<ProbeResult>();
     let buf_addr = call_target_function(pid, offsets.malloc, &[size], None)

@@ -42,6 +42,8 @@ typedef struct {
     uintptr_t dlsym;    // 动态符号查找
     uintptr_t dlerror;
     uintptr_t android_dlopen_ext;  // fd-based dlopen (绕过 SELinux path 检查)
+    // 必须追加在末尾：与 Rust DlOffsets 字段顺序一致，前四个偏移不能变。
+    uintptr_t dlclose;  // 失败补偿：卸载已 dlopen 的库
 } DlOffsets;
 
 // 注入参数结构体（与 Rust AgentArgs 完全一致）
@@ -77,6 +79,7 @@ typedef void* (*dlsym_t)(void*, const char*);
 typedef char* (*dlerror_t)();
 typedef size_t (*strlen_t)(const char *);
 typedef int (*hide_from_solist_t)(void*);
+typedef int (*dlclose_t)(void*);
 
 struct hide_result {
     int32_t version;
@@ -130,6 +133,12 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     pthread_create_t pthread_create = (pthread_create_t)offsets->pthread_create;
     pthread_detach_t pthread_detach = (pthread_detach_t)offsets->pthread_detach;
     strlen_t strlen = (strlen_t)offsets->strlen;
+    dlclose_t dlclose_fn = (dlclose_t)dl->dlclose;
+
+    // fd1(ctrl_fd) 所有权契约：错误路径不关闭，由 host 侧 InjectionGuard 统一补偿；
+    // 成功路径移交给 agent 线程。若这里自行 close，host 的补偿 close 会撞上
+    // 目标复用同一 fd 号的新文件，造成误关。
+    (void)dlclose_fn;
 
     // 获取字符串引用 (现在所有字符串都已经有 NULL 结尾)
     const char* sym_name = (const char*)table->sym_name;
@@ -150,7 +159,6 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     memfd_name[6] = '\0';
     memfd = memfd_create(memfd_name, 0);
     if (memfd < 0) {
-        close(ctrl_fd);
         free(offsets);
         free(dl);
         free(table);
@@ -161,7 +169,6 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     uint64_t agent_size = 0;
     if (read_full(read, ctrl_fd, &agent_size, sizeof(agent_size)) != (ssize_t)sizeof(agent_size)) {
         close(memfd);
-        close(ctrl_fd);
         free(offsets);
         free(dl);
         free(table);
@@ -175,7 +182,6 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : (size_t)remaining;
         if (read_full(read, ctrl_fd, buf, chunk) != (ssize_t)chunk) {
             close(memfd);
-            close(ctrl_fd);
             free(offsets);
             free(dl);
             free(table);
@@ -184,7 +190,6 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         }
         if (write_full(write, memfd, buf, chunk) != (ssize_t)chunk) {
             close(memfd);
-            close(ctrl_fd);
             free(offsets);
             free(dl);
             free(table);
@@ -215,7 +220,6 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         char* msg = dlerror();
         write(ctrl_fd, msg, strlen(msg));
         close(memfd);
-        close(ctrl_fd);
         free(offsets);
         free(dl);
         free(table);
@@ -244,9 +248,23 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     // 查找符号 (sym_name 已有 NULL 结尾，可直接使用)
     void* sym = dlsym(handle, sym_name);
 
+    if (!sym) {
+        // hello_entry 缺失属于加载失败：此时还没 hide，dlclose 能完整卸载。
+        // ctrl_fd 不在这里关：loader 全程不拥有它，错误路径由 host 侧
+        // InjectionGuard 统一补偿，避免与 host 的 close 撞在同一 fd 号上。
+        write(ctrl_fd, dlsym_err, dlsym_err_len);
+        dlclose_fn(handle);
+        close(memfd);
+        free(offsets);
+        free(dl);
+        free(table);
+        free(agent_args);
+        return -7;
+    }
+
     if (!hide_fn) {
         write(ctrl_fd, dlsym_err, dlsym_err_len);
-        close(ctrl_fd);
+        dlclose_fn(handle);
         close(memfd);
         free(offsets);
         free(dl);
@@ -259,7 +277,8 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         struct hide_result *hr = get_result ? get_result() : 0;
         if (hr && hr->error[0])
             write(ctrl_fd, hr->error, strlen(hr->error));
-        close(ctrl_fd);
+        // 隐藏失败会先回滚双链（见 hide_commit），节点仍在链上，dlclose 能卸载。
+        dlclose_fn(handle);
         close(memfd);
         free(offsets);
         free(dl);
@@ -268,7 +287,7 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         return -13;
     }
 
-    if (sym) {
+    {
         pthread_t tid;
         // 传递 agent_args 作为参数给 hello_entry（包含 table 指针和 ctrl_fd）
         if (pthread_create(&tid, NULL, sym, (void*)agent_args) == 0) {
@@ -276,7 +295,9 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
         } else {
             // 发送线程创建失败消息
             write(ctrl_fd, pthread_err, pthread_err_len);
-            close(ctrl_fd);
+            // 此时已 hide（节点不在链上），dlclose 可能找不到 handle：
+            // 尽力卸载；即使失败，链上已不可见。
+            dlclose_fn(handle);
             close(memfd);
             free(offsets);
             free(dl);
@@ -284,22 +305,12 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
             free(agent_args);
             return -6;
         }
-    } else {
-        // 发送符号查找失败消息
-        write(ctrl_fd, dlsym_err, dlsym_err_len);
-        close(ctrl_fd);
-        close(memfd);
-        free(offsets);
-        free(dl);
-        free(table);
-        free(agent_args);
-        return -7;
     }
 
     close(memfd);
     free(offsets);
     free(dl);
     // 不释放 table 和 agent_args（agent 线程继续使用）
-    // 不关闭 ctrl_fd（agent 线程继续使用）
+    // 不关闭 ctrl_fd：成功路径移交给 agent 线程（hello_entry from_raw_fd 接管）
     return 1;
 }

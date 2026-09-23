@@ -48,6 +48,9 @@ use std::time::Duration;
 extern "C" {
     fn get_hide_result() -> *const c_void;
     fn hide_from_solist(handle: *mut c_void) -> i32;
+    // 测试专用（HIDE_FAULT_INJECTION）：与 rust_set_hide_fault_stage 一起条件编译，
+    // 发布构建不得携带故障注入入口。
+    #[cfg(feature = "fault-injection")]
     fn set_hide_fault_stage(stage: i32);
 }
 
@@ -62,6 +65,9 @@ pub extern "C" fn rust_hide_from_solist(handle: *mut c_void) -> i32 {
 }
 
 /// 测试专用：设置隐藏事务故障注入阶段，供 host 在注入 hide 前触发部分写入。
+/// 仅 fault-injection feature（test artifact）导出；发布构建不编入，
+/// 避免任何能调用导出符号的主体主动中断隐藏事务。
+#[cfg(feature = "fault-injection")]
 #[no_mangle]
 pub extern "C" fn rust_set_hide_fault_stage(stage: i32) {
     unsafe { set_hide_fault_stage(stage) }

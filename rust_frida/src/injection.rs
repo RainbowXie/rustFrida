@@ -55,6 +55,9 @@ pub(crate) enum DebugInjectMode {
     /// 先按 so-only 隐藏，再用独立 dl_iterate_phdr 探针从外部确认不在链上。
     #[value(name = "probe")]
     Probe,
+    /// 不加载任何业务库，只跑独立枚举探针；用于故障后验证目标已回到干净状态。
+    #[value(name = "probe-only")]
+    ProbeOnly,
 }
 
 impl DebugInjectMode {
@@ -70,6 +73,7 @@ impl DebugInjectMode {
             Self::SoFdThread => "完整注入（不启动 REPL）",
             Self::FdOnly => "仅创建 socketpair",
             Self::Probe => "so-only 隐藏 + 独立 dl_iterate_phdr 探针",
+            Self::ProbeOnly => "仅独立 dl_iterate_phdr 探针（不加载业务库）",
         }
     }
 
@@ -103,7 +107,17 @@ impl DebugInjectMode {
 
     /// probe 模式在隐藏成功后额外跑一次独立枚举。
     pub(crate) fn needs_independent_probe(&self) -> bool {
-        matches!(self, Self::Probe)
+        matches!(self, Self::Probe | Self::ProbeOnly)
+    }
+
+    /// probe-only 只跑探针，不加载业务库。
+    pub(crate) fn probe_only(&self) -> bool {
+        matches!(self, Self::ProbeOnly)
+    }
+
+    /// 探针自身的 dlopen/dlclose 需要 libdl offsets，与业务加载无关。
+    pub(crate) fn needs_dl_offsets(&self) -> bool {
+        self.needs_dlopen() || self.probe_only()
     }
 }
 
@@ -243,8 +257,8 @@ pub(crate) fn inject_debug(
 
     let offsets = LibcOffsets::calculate(self_base, target_base)?;
 
-    // ptrace-only 不需要 libdl
-    let dl_offsets = if mode.needs_dlopen() {
+    // 需要 libdl 的模式：业务 dlopen 或探针自装卸载。
+    let dl_offsets = if mode.needs_dl_offsets() {
         let self_dl_base = get_lib_base(None, "libdl.so")?;
         let target_dl_base = get_lib_base(Some(pid), "libdl.so")?;
         Some(DlOffsets::calculate(self_dl_base, target_dl_base)?)
@@ -262,6 +276,9 @@ pub(crate) fn inject_debug(
     attach_to_process(pid)?;
     let mut guard = InjectionGuard::new(pid, -1);
     guard.set_offsets(&offsets);
+    if let Some(dl) = dl_offsets.as_ref() {
+        guard.set_dl_offsets(dl);
+    }
     // 故障注入点：attach 之后、资源获取之前。
     fault::maybe_fail(fault::FAULT_ATTACH_DONE)?;
 
@@ -348,7 +365,11 @@ pub(crate) fn inject_debug(
                 return Err(e);
             }
         };
-        // 故障注入点：dlopen 成功后、隐藏之前。
+        // handle 立即入账：dlopen 之后的任一失败（含故障注入与隐藏失败）都必须
+        // 把已加载对象从目标里卸掉，否则失败残留会被后续枚举当成真实库。
+        guard.own_handle(handle);
+        // 故障注入点：dlopen 成功后、隐藏之前。此时 guard 持有 handle，
+        // 返回 Err 会触发 Drop 远程 dlclose，目标回到未加载状态。
         if let Err(e) = fault::maybe_fail(fault::FAULT_DLOPEN_DONE) {
             return Err(e);
         }
@@ -358,6 +379,8 @@ pub(crate) fn inject_debug(
         if !mode.use_empty_so() && handle != 0 {
             invoke_hide_from_solist(pid, handle, &offsets, dl)?;
         }
+        // 到这里加载是预期结果（隐藏成功或空 SO 保留），解除 handle 清理责任。
+        guard.release_handle(handle);
     }
 
     // probe 模式：隐藏后再用独立枚举从外部确认，不依赖 HideResult 自报。

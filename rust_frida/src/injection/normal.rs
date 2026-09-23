@@ -39,7 +39,13 @@ fn spawn_agent_blob_sender(host_fd: RawFd) -> Result<std::thread::JoinHandle<Res
         ));
     }
 
-    let payload = AGENT_SO.to_vec();
+    let payload = if super::fault::wants_stage(super::fault::FAULT_SHELLCODE_RET) {
+        // shellcode 非 1 分支测试：发送截断 blob 追使 loader dlopen 真实失败。
+        super::fault::note_marker(super::fault::FAULT_SHELLCODE_RET, "发送截断 blob，迫使 loader 加载失败");
+        vec![0u8; 8]
+    } else {
+        AGENT_SO.to_vec()
+    };
     Ok(std::thread::spawn(move || {
         let len = (payload.len() as u64).to_le_bytes();
         let mut written = 0usize;
@@ -71,6 +77,9 @@ fn spawn_agent_blob_sender(host_fd: RawFd) -> Result<std::thread::JoinHandle<Res
         }
 
         unsafe { close(fd) };
+        // sender 错误分支测试：blob 已完整送达（loader 会成功），
+        // 仅上报发送端错误，覆盖 Ok(Err) 分支的清理路径。
+        super::fault::maybe_fail(super::fault::FAULT_SENDER_ERROR)?;
         Ok(())
     }))
 }
@@ -101,16 +110,18 @@ pub(crate) fn inject_to_process(
     }
 
     attach_to_process(pid)?;
+    let mut guard = InjectionGuard::new(pid, -1);
+    // attach 之后、任何故障点之前就建立 Guard：此后 attach 后路径
+    // 全部经由同一个 Guard 退出，禁止在 Guard 建立前返回（ISSUE-027）。
+    guard.set_offsets(&offsets);
+    guard.set_dl_offsets(&dl_offsets);
     // 故障注入点：attach 之后、资源获取之前。
     if let Err(e) = super::fault::maybe_fail(super::fault::FAULT_ATTACH_DONE) {
         return Err(e);
     }
 
-    let mut guard = InjectionGuard::new(pid, -1);
-
     let (fd0, fd1) = create_socketpair_in_target(pid, &offsets)?;
     // 目标 fd 立即入账：后续任一失败分支都由 guard 补偿关闭。
-    guard.set_offsets(&offsets);
     guard.own_target_fd(fd0);
     guard.own_target_fd(fd1);
     // 故障注入点：socketpair 创建后、提取 host_fd 之前。
@@ -173,12 +184,18 @@ pub(crate) fn inject_to_process(
     let dloffset_addr = alloc_and_write_struct(pid, offsets.malloc, &dl_offsets, "dloffsets")?;
     let sender = spawn_agent_blob_sender(host_fd)?;
 
-    match call_target_function(
-        pid,
-        shellcode_addr,
-        &[offsets_addr, dloffset_addr, string_table_addr, agent_args_addr],
-        None,
-    ) {
+    // 远程调用异常故障：跳过真实调用并按异常返回，覆盖 Err 分支的补偿清理。
+    let call_result = if super::fault::wants_stage(super::fault::FAULT_REMOTE_CALL) {
+        Err(super::fault::remote_call_error())
+    } else {
+        call_target_function(
+            pid,
+            shellcode_addr,
+            &[offsets_addr, dloffset_addr, string_table_addr, agent_args_addr],
+            None,
+        )
+    };
+    match call_result {
         Ok(return_value) => {
             let ret = return_value as u32 as i32 as isize;
             log_verbose!("Shellcode 执行完成，返回值: 0x{:x}", ret);
@@ -197,24 +214,24 @@ pub(crate) fn inject_to_process(
                     _ => "未知错误",
                 };
                 let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
-                let _ = ptrace::detach(Pid::from_raw(pid), None);
-                let fd = guard.into_fd();
-                unsafe { close(fd) };
+                // 不调用 into_fd：那是成功转交语义。fd1 尚未移交给 agent
+                // （shellcode 失败），仍归 Guard，由 Drop 补偿关闭并 detach（ISSUE-028）。
                 return Err(format!("Shellcode 执行失败 ({}): {}", ret, reason));
             }
+
+            // shellcode 返回 1 的契约：loader 已把 fd1 移交给 agent 线程
+            // （hello_entry from_raw_fd 接管），此处才解除 Guard 的补偿责任。
+            guard.release_target_fd(fd1);
 
             match sender.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    let _ = ptrace::detach(Pid::from_raw(pid), None);
-                    let fd = guard.into_fd();
-                    unsafe { close(fd) };
+                    // sender 错误：fd1 已归 agent，Guard 只需收 host_fd 并 detach。
+                    let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
                     return Err(e);
                 }
                 Err(_) => {
-                    let _ = ptrace::detach(Pid::from_raw(pid), None);
-                    let fd = guard.into_fd();
-                    unsafe { close(fd) };
+                    let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
                     return Err("agent 发送线程 panic".to_string());
                 }
             }
@@ -234,9 +251,9 @@ pub(crate) fn inject_to_process(
         }
         Err(e) => {
             log_error!("执行 shellcode 失败: {}", e);
-            let fd = guard.into_fd();
-            unsafe { close(fd) };
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
+            // shellcode 映射在调用前已建立，无论调用是否真的跑过都要归还。
+            let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
+            // 其余清理（fd1/host_fd/detach）由 Guard Drop 统一补偿。
             Err(e)
         }
     }

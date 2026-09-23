@@ -1,8 +1,8 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use libc::{
-    c_void, close, dlerror, dlopen, dlsym, free, malloc, memfd_create, mmap, munmap, pthread_create, pthread_detach,
-    read, socketpair, strlen, write,
+    c_void, close, dlclose, dlerror, dlopen, dlsym, free, malloc, memfd_create, mmap, munmap, pthread_create,
+    pthread_detach, read, socketpair, strlen, write,
 };
 use paste::paste;
 use std::os::raw::c_int;
@@ -161,11 +161,14 @@ define_libc_functions!(
     strlen
 );
 
+// DlOffsets 同时被写入目标进程并被 loader.c 按相同字段顺序读取，
+// 新增字段只能追加到末尾，否则 loader 侧偏移整体错位。
 define_dl_functions!(
     dlopen, // 动态加载
     dlsym,  // 动态符号查找
     dlerror,
-    android_dlopen_ext // fd-based dlopen (绕过 SELinux)
+    android_dlopen_ext, // fd-based dlopen (绕过 SELinux)
+    dlclose // 卸载已加载库：失败补偿路径必须能把 handle 退回零残留状态
 );
 
 /// 注入参数结构体，传递给 shellcode → agent

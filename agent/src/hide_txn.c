@@ -431,15 +431,16 @@ int hide_commit(struct hide_plan *plan) {
     }
     g_hide_result.soinfo_state = CHAIN_HIDDEN;
 
+#ifdef HIDE_FAULT_INJECTION
     /* 测试故障注入：soinfo 摘除成功、link_map 尚未写入时强制失败，
-       用来验证部分写入状态能被完整回滚。 */
+       用来验证部分写入状态能被完整回滚。生产构建不编译本块。 */
     if (g_hide_fault_stage == FAULT_STAGE_HIDE_PARTIAL) {
         journal_rollback(&journal);
         g_hide_result.soinfo_state = CHAIN_ROLLED_BACK;
         g_hide_result.wrote = HIDE_WROTE_NONE;
         return fail_stage(HIDE_STAGE_WRITE_LINKMAP, -11, "FAULT@hide_partial: injected");
     }
-
+#endif
     g_hide_result.stage = HIDE_STAGE_WRITE_LINKMAP;
     if (unlink_link_map(plan, &journal) != 0) {
         journal_rollback(&journal);

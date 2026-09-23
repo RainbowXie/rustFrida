@@ -1,12 +1,20 @@
 include!("../build-support/compiler_rt.rs");
 
 fn main() {
+    // 故障注入入口（HIDE_FAULT_INJECTION）在本 crate 永不编译：真机故障测试
+    // 只走 agent.so 路径，而本 crate 没有 rust_set_hide_fault_stage 包装，
+    // 编入 C 侧判定只会留下无法受控触发的死代码面。
     cc::Build::new()
         .include("../agent/src")
         .file("../agent/src/hide_soinfo.c")
         .file("../agent/src/hide_linker.c")
         .file("../agent/src/hide_txn.c")
         .compile("hide_soinfo");
+
+    // 与 agent 一致：cdylib 只导出 Rust 侧 rust_* 包装，C 同名函数会被 localize。
+    println!(
+        "cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,rust_get_hide_result,-u,hide_from_solist,-u,rust_hide_from_solist,--export-dynamic-symbol=rust_get_hide_result,--export-dynamic-symbol=rust_hide_from_solist"
+    );
 
     let manifest_dir =
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -41,10 +49,7 @@ fn main() {
 
     link_compiler_rt_builtins();
 
-    // 与 agent 一致：cdylib 只导出 Rust 侧 rust_* 包装，C 同名函数会被 localize。
-    println!(
-        "cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,-u,rust_get_hide_result,-u,hide_from_solist,-u,rust_hide_from_solist,-u,set_hide_fault_stage,-u,rust_set_hide_fault_stage,--export-dynamic-symbol=rust_get_hide_result,--export-dynamic-symbol=rust_hide_from_solist,--export-dynamic-symbol=rust_set_hide_fault_stage"
-    );
+    // 导出参数已在上方生成。
     println!("cargo:rerun-if-changed=../agent/src/hide_soinfo.c");
     println!("cargo:rerun-if-changed=../agent/src/hide_soinfo.h");
     println!("cargo:rerun-if-changed=../agent/src/hide_linker.c");

@@ -2,6 +2,12 @@
 frida-gum = []
 qbdi = []
 watch-so = ["dep:ldmonitor"]
+# 测试专用故障注入控制面，正式发布构建禁止启用（须与 agent 同名 feature 同时启用）。
+# 为什么单独门控：测试控制面（RUSTFRIDA_FAULT_STAGE/FAULT@ 与 rust_set_hide_fault_stage
+# 导出）会让任何能影响环境或调用导出符号的主体主动中断注入，不得进入生产发布物；
+# 发布门禁（release.sh）断言产物不含这些字符串。真机故障测试用
+# scripts/build-test-artifact.sh 构建单独标记的 test artifact。
+fault-injection = []
 
 [package]
 name = "rust_frida"

@@ -146,6 +146,29 @@ if [[ -f "$agent_so" ]]; then
         exit 1
       fi
     done
+
+    # 测试控制面不得进入发布物（fault-injection feature 未启用才允许发布）。
+    # 为什么：携带 RUSTFRIDA_FAULT_STAGE/FAULT@ 或 rust_set_hide_fault_stage 导出的产物，
+    # 可被任何能影响环境或调用导出符号的主体主动中断注入/隐藏事务。
+    # 真机故障测试走 scripts/build-test-artifact.sh 产出的单独 test artifact。
+    # 注意：以下检查一律用 grep -c 计数而非 grep -q——后者命中即关管道，strings 收
+    # SIGPIPE(141) 会让 pipefail 下的管道整体非零，在 if 条件里反而放行违禁产物。
+    if [[ "$(strings "$host_bin" | grep -cE 'RUSTFRIDA_FAULT_STAGE|FAULT@' || true)" != "0" ]]; then
+      echo "release artifact carries fault-injection control strings: $host_bin" >&2
+      echo "build without the fault-injection feature; test artifact is built by scripts/build-test-artifact.sh" >&2
+      exit 1
+    fi
+    for so in "$agent_so" "$helper_so"; do
+      if [[ -f "$so" ]] && [[ "$(strings "$so" | grep -cE 'RUSTFRIDA_FAULT_STAGE|FAULT@' || true)" != "0" ]]; then
+        echo "release artifact carries fault-injection control strings: $so" >&2
+        exit 1
+      fi
+      if [[ -f "$so" ]] && [[ "$("$nm_tool" -D "$so" 2>/dev/null | grep -c 'rust_set_hide_fault_stage' || true)" != "0" ]]; then
+        echo "release artifact exports rust_set_hide_fault_stage: $so" >&2
+        echo "fault entry must stay feature-gated out of release builds" >&2
+        exit 1
+      fi
+    done
   fi
 fi
 
