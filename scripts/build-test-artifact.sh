@@ -59,6 +59,10 @@ profile_flag=(--release)
 [[ "$profile" == "debug" ]] && profile_flag=()
 
 echo "== 构建 fault-injection test artifact（$profile）=="
+# 三个被 include_bytes! 嵌入 rustfrida 的 blob 必须全部来自本次构建：
+# 漏掉 qbdi-helper 会让嵌入的 helper.so 变成上一次任意构建的残留，
+# 同一 HEAD 两次构建产出不同哈希，SHA-256 收据就无法绑定 HEAD。
+cargo build -p qbdi-helper "${profile_flag[@]}"
 cargo build -p agent --no-default-features --features quickjs,qbdi,fault-injection "${profile_flag[@]}"
 cargo build -p rust_frida --features qbdi,fault-injection "${profile_flag[@]}"
 
@@ -81,4 +85,4 @@ echo
 echo "artifact: $test_bin"
 echo "sha256:   $sha"
 echo "head:     $head"
-echo "build:    cargo build -p agent --no-default-features --features quickjs,qbdi,fault-injection ${profile_flag[*]:-} && cargo build -p rust_frida --features qbdi,fault-injection ${profile_flag[*]:-}"
+echo "build:    cargo build -p qbdi-helper ${profile_flag[*]:-} && cargo build -p agent --no-default-features --features quickjs,qbdi,fault-injection ${profile_flag[*]:-} && cargo build -p rust_frida --features qbdi,fault-injection ${profile_flag[*]:-}"
