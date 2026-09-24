@@ -8,7 +8,7 @@ use nix::unistd::close;
 
 use crate::process::{call_target_function, read_memory, write_bytes, write_memory};
 use crate::types::{DlOffsets, LibcOffsets};
-use crate::{log_success, log_verbose, log_verbose_addr};
+use crate::{log_info, log_success, log_verbose, log_verbose_addr, log_warn};
 
 extern "C" {
     #[link_name = "write"]
@@ -38,6 +38,17 @@ pub(crate) fn alloc_and_write_struct<T>(
 }
 
 /// 在目标进程中调用 socketpair()，返回 (fd0, fd1)
+/// 上报本工具在目标内创建的 fd 的精确链接目标（owned_fd_target=<link>）。
+/// 为什么：失败清理的泄漏判定必须按所有权下结论——应用自身的 fd 抖动
+/// （database/DMABUF/jar/自建 socket）与注入资源在链接目标层面无法区分，
+/// 宽口径差分会把应用抖动误判成泄漏。创建时上报的链接目标就是所有权凭证。
+fn report_owned_fd(pid: i32, fd: i32) {
+    match std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+        Ok(target) => log_info!("owned_fd_target={}", target.display()),
+        Err(e) => log_warn!("owned_fd_target 上报失败 (fd={}): {}", fd, e),
+    }
+}
+
 pub(crate) fn create_socketpair_in_target(pid: i32, offsets: &LibcOffsets) -> Result<(i32, i32), String> {
     let sv_addr = call_target_function(pid, offsets.malloc, &[8], None)
         .map_err(|e| format!("分配 socketpair 缓冲区失败: {}", e))?;
@@ -51,6 +62,8 @@ pub(crate) fn create_socketpair_in_target(pid: i32, offsets: &LibcOffsets) -> Re
 
     let sv: [i32; 2] = read_memory(pid, sv_addr)?;
     log_verbose!("socketpair 创建成功: fd0={}, fd1={}", sv[0], sv[1]);
+    report_owned_fd(pid, sv[0]);
+    report_owned_fd(pid, sv[1]);
 
     let _ = call_target_function(pid, offsets.free, &[sv_addr], None);
     Ok((sv[0], sv[1]))
@@ -97,6 +110,7 @@ pub(crate) fn create_memfd_in_target(pid: i32, offsets: &LibcOffsets) -> Result<
     }
 
     log_verbose!("目标进程 memfd_create 成功: fd={}", fd);
+    report_owned_fd(pid, fd);
     Ok(fd)
 }
 

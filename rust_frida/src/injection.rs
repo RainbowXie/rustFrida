@@ -11,7 +11,7 @@ use std::os::fd::RawFd;
 use nix::sys::ptrace;
 use nix::unistd::Pid;
 
-use crate::process::{attach_to_process, call_target_function, get_lib_base, read_memory};
+use crate::process::{attach_to_process, call_target_function, get_lib_base, read_memory, write_bytes};
 use crate::types::{DlOffsets, LibcOffsets};
 use crate::{log_error, log_info, log_success, log_warn};
 
@@ -19,7 +19,7 @@ pub(crate) use guard::InjectionGuard;
 pub(crate) use normal::{inject_to_process, watch_and_inject, AGENT_SO, SHELLCODE};
 #[cfg(feature = "qbdi")]
 pub(crate) use normal::QBDI_HELPER_SO;
-pub(crate) use probe::{run_independent_probe, ProbeResult, PROBE_SO};
+pub(crate) use probe::{confirm_identity, run_independent_probe, verify_hidden, ProbeResult, PROBE_SO};
 pub(crate) use remote::{
     alloc_and_write_struct, create_and_fill_memfd, create_memfd_in_target,
     create_socketpair_in_target, dlopen_agent_via_ptrace, extract_fd_from_target, remote_dlsym,
@@ -282,6 +282,68 @@ pub(crate) fn inject_debug(
     // 故障注入点：attach 之后、资源获取之前。
     fault::maybe_fail(fault::FAULT_ATTACH_DONE)?;
 
+    // 故障注入点（ISSUE-033 反证）：构造永不返回的远程调用，验证 call_target_function
+    // 的有界等待与恢复序列。两种形态都覆盖：纯用户态自旋（b . 桩）与阻塞在系统调用
+    // 等待（socket read）。中止后目标必须完全健康：会话可继续远程调用、堆可分配。
+    if fault::wants_stage(fault::FAULT_REMOTE_HANG) {
+        fault::note_marker(fault::FAULT_REMOTE_HANG, "构造永不返回的远程调用，验证有界等待与现场恢复");
+        // 形态 1：纯用户态自旋（b .，不进内核）。
+        let stub = call_target_function(
+            pid,
+            offsets.mmap,
+            &[
+                0,
+                4096,
+                (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as usize,
+                (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as usize,
+                !0usize,
+                0,
+            ],
+            None,
+        )
+        .map_err(|e| format!("自旋桩 mmap 失败: {}", e))?;
+        // ARM64 `b .`（0x14000000 小端）：永不返回的自旋跳转。
+        write_bytes(pid, stub, &[0x00, 0x00, 0x00, 0x14])?;
+        let spin_outcome = call_target_function(pid, stub, &[], None);
+        // 恢复后会话必须仍可用：远程 munmap 成功即证明 ptrace 会话恢复正常。
+        call_target_function(pid, offsets.munmap, &[stub, 4096], None)
+            .map_err(|e| format!("{}；自旋桩回收失败: {}", "自旋桩中止后会话不可用", e))?;
+        let spin_err = match spin_outcome {
+            Err(ref e) if e.contains("超时") => e.clone(),
+            Ok(ret) => return Err(format!("自旋桩应超时却返回 0x{:x}（有界等待未生效）", ret)),
+            Err(ref e) => return Err(format!("自旋桩等待异常但非超时: {}", e)),
+        };
+        // 形态 2：阻塞在系统调用等待的远程调用（socket read，对端不写入）。
+        // 中止这类调用必须抑制 -ERESTARTSYS 重启，否则内核会拿还原后的寄存器
+        // 重放系统调用，目标状态被粘性破坏（实测：中止后 malloc 永久挂死）。
+        let (fd0, fd1) =
+            create_socketpair_in_target(pid, &offsets).map_err(|e| format!("socketpair 创建失败: {}", e))?;
+        let buf = call_target_function(pid, offsets.malloc, &[64], None)
+            .map_err(|e| format!("read 缓冲区分配失败: {}", e))?;
+        let read_outcome = call_target_function(pid, offsets.read, &[fd1 as usize, buf, 1], None);
+        let _ = call_target_function(pid, offsets.free, &[buf], None);
+        let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
+        let _ = call_target_function(pid, offsets.close, &[fd1 as usize], None);
+        let read_err = match read_outcome {
+            Err(ref e) if e.contains("超时") => e.clone(),
+            Ok(ret) => return Err(format!("阻塞 read 应超时却返回 {}（有界等待未生效）", ret)),
+            Err(ref e) => return Err(format!("阻塞 read 等待异常但非超时: {}", e)),
+        };
+        // 中止后堆必须完好：malloc/free 正常才能证明回卷没有留下粘性破坏。
+        let probe_alloc = call_target_function(pid, offsets.malloc, &[64], None)
+            .map_err(|e| format!("中止后 malloc 失败（目标堆可能已被破坏）: {}", e))?;
+        call_target_function(pid, offsets.free, &[probe_alloc], None)
+            .map_err(|e| format!("中止后 free 失败: {}", e))?;
+        fault::note_marker(
+            fault::FAULT_REMOTE_HANG,
+            "反证通过：自旋桩与阻塞系统调用均超时恢复，目标 malloc/free 正常",
+        );
+        return Err(format!(
+            "远程调用超时反证通过（自旋桩：{}；阻塞 read：{}）；恢复后 malloc/free 正常",
+            spin_err, read_err
+        ));
+    }
+
     if mode == DebugInjectMode::PtraceOnly {
         let ptr =
             call_target_function(pid, offsets.malloc, &[64], None).map_err(|e| format!("调用 malloc 失败: {}", e))?;
@@ -376,23 +438,40 @@ pub(crate) fn inject_debug(
         let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);
         guard.release_target_fd(target_memfd);
         log_success!("{} dlopen 完成", label);
-        if !mode.use_empty_so() && handle != 0 {
-            invoke_hide_from_solist(pid, handle, &offsets, dl)?;
+        // 身份采集（ISSUE-032）：拿目标库内一个符号地址，让探针在隐藏前独立核对出
+        // 确定身份（load bias）。隐藏后的验收只看这个身份是否还在两条链上，
+        // 同名的合法保留载荷（如测试空 SO）不参与判定。
+        let mut identity: Option<(usize, u64)> = None;
+        if mode.needs_independent_probe() && !mode.use_empty_so() && handle != 0 {
+            let sym = remote_dlsym(pid, dl, &offsets, handle, b"rust_get_hide_result\0")?;
+            if sym == 0 {
+                return Err("dlsym(rust_get_hide_result) 返回 NULL，无法建立身份锚点".to_string());
+            }
+            let pre = run_independent_probe(pid, &offsets, dl, Some((sym, 0)))?;
+            identity = Some((sym, confirm_identity(&pre)?));
         }
-        // 到这里加载是预期结果（隐藏成功或空 SO 保留），解除 handle 清理责任。
+        if !mode.use_empty_so() && handle != 0 {
+            if fault::wants_stage(fault::FAULT_HIDE_SKIP) {
+                // 负向测试：跳过隐藏事务，探针必须仍能按身份检出未摘链的目标。
+                fault::note_marker(fault::FAULT_HIDE_SKIP, "跳过隐藏事务，验证探针按身份检出未摘链目标");
+            } else {
+                invoke_hide_from_solist(pid, handle, &offsets, dl)?;
+            }
+        }
+        // 隐藏被外部观测确认后才解除 handle 清理责任；
+        // 失败分支（含负向测试）由 Drop 远程 dlclose，不留未摘链目标。
+        if let Some((sym, bias)) = identity {
+            let post = run_independent_probe(pid, &offsets, dl, Some((sym, bias)))?;
+            verify_hidden(&post, bias)?;
+        }
         guard.release_handle(handle);
     }
 
-    // probe 模式：隐藏后再用独立枚举从外部确认，不依赖 HideResult 自报。
-    if mode.needs_independent_probe() {
+    // probe-only：纯测量模式。同名载荷按地址列出，验收裁决由调用方按身份做，
+    // 探针不按名字下结论——合法保留的同名空 SO 不是残留（ISSUE-032）。
+    if mode.probe_only() {
         let dl = dl_offsets.as_ref().expect("probe 模式需要 libdl offsets");
-        let probe = run_independent_probe(pid, &offsets, dl)?;
-        if probe.wwb_matches != 0 || probe.rmap_wwb_matches != 0 {
-            return Err(format!(
-                "独立枚举仍能看到目标库（solist={} r_map={}），隐藏未被外部观测确认",
-                probe.wwb_matches, probe.rmap_wwb_matches
-            ));
-        }
+        run_independent_probe(pid, &offsets, dl, None)?;
     }
 
     // detach 前检查 maps 中 memfd/wwb 条目（调试用）

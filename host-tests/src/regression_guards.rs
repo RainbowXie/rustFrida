@@ -158,3 +158,151 @@ fn qbdi_load_fails_when_hide_fails() {
         "must require both chains to report hidden, not just status"
     );
 }
+
+/// call_target_function 的等待必须是有界状态机（ISSUE-033）。
+/// waitpid(None) 无限期等待是孤儿 tracer 的来源：rustfrida 挂死被外层杀掉后，
+/// 目标后续 attach 全部 EPERM，失败后不可恢复。
+#[test]
+fn remote_call_wait_is_bounded() {
+    let src = code_lower("rust_frida/src/process.rs");
+    let start = src
+        .find("fn call_target_function")
+        .expect("call_target_function missing");
+    let body = &src[start..];
+    let end = body
+        .find("向远程进程内存写入任意类型的数据")
+        .unwrap_or(body.len());
+    let body = &body[..end];
+    assert!(
+        !body.contains("waitpid(target_pid, none)"),
+        "remote call must not block on an unbounded waitpid"
+    );
+    assert!(body.contains("wnohang"), "remote call wait must poll with WNOHANG");
+    assert!(
+        body.contains("deadline") || body.contains("timeout"),
+        "remote call wait must enforce an upper bound"
+    );
+    assert!(body.contains("interrupt"), "timeout recovery must stop the tracee before restoring");
+}
+
+/// 探针自卸是成功的必要条件（ISSUE-034）。
+/// 当前缺陷形态是 `if let Err → log_error 后照常返回测量结果`：探针自己留在链上，
+/// 下一次探测把它当成历史残留，双链验收从此失真。
+/// 负向证明：本守卫在修复前的源码上必须红（本轮 RED 阶段实测如此），
+/// 修复后转绿；若将来有人移除 verify_probe_unloaded 步骤则再次变红。
+#[test]
+fn probe_self_unload_is_verified_not_swallowed() {
+    let src = code_lower("rust_frida/src/injection/probe.rs");
+    assert!(src.contains("dlclose"), "probe must unload itself");
+    // 卸载验证必须是独立的可失败步骤（声明与调用两侧都在合同内，
+    // 声明签名带冒号、调用带逗号，避免声明本身满足调用断言的空转）。
+    assert!(
+        src.contains("fn verify_probe_unloaded(pid:"),
+        "probe must verify its own disappearance through a dedicated fallible step"
+    );
+    assert!(
+        src.contains("verify_probe_unloaded(pid,"),
+        "run_independent_probe must actually invoke the unload verification"
+    );
+    assert!(
+        !src.contains("if let err(e) = call_target_function(pid, dl.dlclose"),
+        "dlclose failure must be propagated as an error, not logged and swallowed"
+    );
+    assert!(
+        src.contains("/proc/") && src.contains("maps"),
+        "probe must verify its own disappearance via maps before reporting success"
+    );
+}
+
+/// 提取 fault.rs 的全部字符串故障阶段名。
+fn fault_stages() -> Vec<String> {
+    let src = read("rust_frida/src/injection/fault.rs");
+    src.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if !l.starts_with("pub(crate) const FAULT_") || !l.contains(": &str =") {
+                return None;
+            }
+            let value = l.split("= \"").nth(1)?;
+            Some(value.split('"').next()?.to_string())
+        })
+        .collect()
+}
+
+/// 求 stages 中未被 script 覆盖的项；单独成函数以便负向测试证明它能报缺。
+fn uncovered_stages(stages: &[String], script: &str) -> Vec<String> {
+    stages
+        .iter()
+        .filter(|s| !script.contains(s.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// 每个故障阶段都必须有真机脚本调用点（ISSUE-019 精神的延续）。
+/// 新阶段加了却没被设备验证，等于故障注入面悄悄开了天窗。
+#[test]
+fn every_fault_stage_is_exercised_by_repeat_script() {
+    let script = read("host-tests/scripts/android16-repeat-retry.sh");
+    let stages = fault_stages();
+    assert!(!stages.is_empty(), "no fault stages parsed from fault.rs");
+    let missing = uncovered_stages(&stages, &script);
+    assert!(missing.is_empty(), "fault stages not exercised on device: {missing:?}");
+}
+
+/// 负向测试：覆盖检查必须能报缺，否则空转通过。
+#[test]
+fn uncovered_stage_detection_reports_missing() {
+    let missing = uncovered_stages(&["never_in_script".to_string()], "nothing here");
+    assert_eq!(missing, vec!["never_in_script".to_string()]);
+}
+
+/// 泄漏门禁按所有权下结论：创建 fd 的代码必须上报精确链接目标
+/// （owned_fd_target=），否则门禁只能做会假阳的宽口径差分（实测 Settings 的
+/// database/DMABUF/jar/自建 socket 抖动曾多次假阳）。
+/// 负向证明：本守卫在上报落地前必须红（本轮 RED 实测如此）。
+#[test]
+fn created_fds_are_reported_for_ownership_gating() {
+    let src = code_lower("rust_frida/src/injection/remote.rs");
+    assert!(
+        src.contains("fn report_owned_fd("),
+        "创建 fd 必须经由 report_owned_fd 上报所有权凭证"
+    );
+    let calls = src.matches("report_owned_fd(").count();
+    assert!(
+        calls >= 4,
+        "memfd 与 socketpair 双 fd 都必须上报（声明 + 至少 3 个调用点，实际 {calls} 处）"
+    );
+}
+
+/// InjectionGuard 必须在会话期间解冻被系统冷藏的目标，并在收尾恢复冻结位。
+/// 为什么：Android cached-app freezer（cgroup.freeze=1）让目标连 PTRACE_CONT 的代码
+/// 都无法执行——实测 mmap 级远程调用全部超时，而目标 State 仍显示 S，极难诊断。
+/// 恢复侧同样必须存在：否则 root 工具会把系统应用留在不该在的热状态。
+#[test]
+fn guard_thaws_frozen_target_and_restores_freeze() {
+    let src = code_lower("rust_frida/src/injection/guard.rs");
+    assert!(
+        src.contains("thaw_target_for_session"),
+        "guard must unfreeze a system-frozen target for the session"
+    );
+    assert!(
+        src.contains("restore_target_freeze"),
+        "guard must restore the target's freeze state after the session"
+    );
+    assert!(
+        src.contains("fn drop"),
+        "restore must ride the RAII exit so failure paths cannot skip it"
+    );
+}
+
+/// 负向测试：只解冻不恢复必须被上面的守卫抓住（不会红的守卫是废纸）。
+#[test]
+fn freeze_guard_detects_missing_restore() {
+    let thaw_only = "fn drop() { thaw_target_for_session(pid); }";
+    assert!(
+        !thaw_only.contains("restore_target_freeze"),
+        "precondition broken: synthetic fixture must lack the restore step"
+    );
+    let missing = !thaw_only.contains("restore_target_freeze");
+    assert!(missing, "guard logic must flag a thaw-only implementation");
+}

@@ -52,10 +52,11 @@
       （全部经 `host-tests/scripts/android16-repeat-retry.sh` 真机验证，收据绑定本地 HEAD 产物 SHA-256。
       attach：同进程连续 3 次注入成功；attach_done / socketpair_created / memfd_created / dlopen_done / hide_partial 五个故障阶段，
       加正常注入失败分支的 shellcode_ret / remote_call / sender_error，各命中一次真实故障（错误串 FAULT@<stage>、退出码非 0）。
-      每个故障后断言：目标 fd 链接目标集合相对零注入噪声基线无新增、无 wwb_so memfd fd 残留、无 rustfrida 进程残留、
-      目标 state 非 T/t、TracerPid=0、/proc/<pid>/maps 的 /memfd:wwb 映射数与故障前持平、
-      独立 dl_iterate_phdr + _r_debug.r_map 双链探针报 solist/r_map 匹配均为 0（sender_error 按语义除外：
-      该分支注入已成功、agent 合法接管 socketpair，仅上报路径失败）。
+      每个故障后断言：rustfrida 创建的 fd 逐条按所有权凭证（owned_fd_target）确认已关闭或按语义转交、无 wwb_so memfd fd 残留、无 rustfrida 进程残留、目标 state 非 T/t、TracerPid=0、/proc/<pid>/maps 的 /memfd:wwb 映射数与故障前持平、独立双链探针的同名载荷 bias 集合与基线逐地址相等（sender_error 按语义除外：该分支注入已成功、agent 合法接管 socketpair，仅上报路径失败）。
+      fd 泄漏判定按所有权下结论：应用自身 fd 抖动（database/DMABUF/jar/自建 socket）与注入资源在链接目标层面不可区分，宽口径新增目标仅记录进收据不判失败（实测多次假阳）；所有权门禁经负向测试（故意保留 fd1 必须被抓）。
+      隐藏验收按地址身份（ISSUE-032）：host 传入目标库内地址，探针独立核对 load bias 后只判该身份是否仍在双链；反例测试证明合法同名空 SO 不误判、跳过隐藏事务（hide_skip）的未摘链目标必被检出。
+      远程调用为有界等待（ISSUE-033）：remote_hang 反证用自旋桩与阻塞系统调用两种永不返回形态验证超时中断、现场恢复（目标 malloc/free 正常）、TracerPid=0 且目标可再次注入。
+      探针自卸是成功必要条件（ISSUE-034）：dlclose 返回码与 maps 差分都验证，失败响亮报错；每次探测用唯一名加载（bionic soname 缓存会让泄漏引用把探针变成永久隐形驻留），泄漏探针实测被 bias 集合差分检出。
       全部故障后同一 PID 重试注入成功，最终再跑独立探针确认双链无历史故障残留。
       spawn：同进程名连续 3 次完整流程（新进程注入 + 15s 存活监控 + Zygote patch 还原）成功；
       以 shellcode_ret 故障迫使新进程当场失败后，再次 spawn 成功。

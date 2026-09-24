@@ -9,7 +9,7 @@ use std::os::fd::RawFd;
 use nix::sys::ptrace;
 use nix::unistd::{close, Pid};
 
-use crate::process::call_target_function;
+use crate::process::{call_target_function, restore_target_freeze, thaw_target_for_session};
 use crate::types::{DlOffsets, LibcOffsets};
 
 /// RAII guard: 注入失败时自动卸载 handle、关闭目标 fd、host_fd 并 detach。
@@ -26,11 +26,16 @@ pub(crate) struct InjectionGuard {
     target_fds: Vec<i32>,
     /// 已 dlopen 的 handle；隐藏成功保留、失败路径由 drop 远程 dlclose。
     target_handles: Vec<usize>,
+    /// 会话前被系统冻结的目标的冻结位路径；收尾必须恢复，见 drop。
+    freeze_to_restore: Option<String>,
     disarmed: bool,
 }
 
 impl InjectionGuard {
     pub(crate) fn new(pid: i32, host_fd: RawFd) -> Self {
+        // 被 cached-app freezer 冻结的目标连远程调用都无法执行，会话期间必须解冻；
+        // 恢复冻结位是 drop 的固定职责，与 disarmed 无关（系统记账仍是冻结态）。
+        let freeze_to_restore = thaw_target_for_session(pid);
         Self {
             pid,
             offsets: None,
@@ -38,6 +43,7 @@ impl InjectionGuard {
             host_fd,
             target_fds: Vec::new(),
             target_handles: Vec::new(),
+            freeze_to_restore,
             disarmed: false,
         }
     }
@@ -123,6 +129,11 @@ impl Drop for InjectionGuard {
                 let _ = close(self.host_fd);
             }
             let _ = ptrace::detach(Pid::from_raw(self.pid), None);
+        }
+        // 冻结位恢复与 disarmed 无关：无论成败，工具会话前目标是冻结的就恢复冻结，
+        // 不能把系统记账与真实状态的漂移留给调用方；放在 detach 之后（目标恢复自由）。
+        if let Some(path) = self.freeze_to_restore.take() {
+            restore_target_freeze(&path);
         }
     }
 }

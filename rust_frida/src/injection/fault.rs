@@ -19,6 +19,12 @@ pub(crate) const FAULT_SHELLCODE_RET: &str = "shellcode_ret";
 pub(crate) const FAULT_SENDER_ERROR: &str = "sender_error";
 /// 正常注入分支覆盖：远程调用本身抛错（Err 分支）。
 pub(crate) const FAULT_REMOTE_CALL: &str = "remote_call";
+/// ISSUE-033 反证：远程函数永不返回（b . 自旋桩），验证有界等待与现场恢复。
+pub(crate) const FAULT_REMOTE_HANG: &str = "remote_hang";
+/// ISSUE-032 负向测试：跳过隐藏事务，探针必须仍能按身份检出未摘链目标。
+pub(crate) const FAULT_HIDE_SKIP: &str = "hide_skip";
+/// ISSUE-034 负向测试：探针自卸失败分支必须响亮报错，且可被后续探测发现。
+pub(crate) const FAULT_PROBE_DLCLOSE_FAIL: &str = "probe_dlclose_fail";
 
 /// C 侧 g_hide_fault_stage 的取值，与 agent/src/hide_soinfo.h 保持一致。
 pub(crate) const FAULT_STAGE_HIDE_PARTIAL: i32 = 1;

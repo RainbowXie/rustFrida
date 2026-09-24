@@ -176,6 +176,37 @@ fn set_registers(pid: i32, regs: &UserRegs) -> Result<(), String> {
     Ok(())
 }
 
+/// 目标 cgroup v2 冻结位路径；None 表示该目标没有可操作的冻结位（如宿主非 cgroup v2）。
+fn freeze_path(pid: i32) -> Option<String> {
+    let cgroups = std::fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
+    let rel = cgroups.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let path = format!("/sys/fs/cgroup{}/cgroup.freeze", rel);
+    std::fs::metadata(&path).ok()?;
+    Some(path)
+}
+
+/// 会话期间解冻被系统冷藏的目标；返回冻结位路径供收尾恢复（未冻结返回 None）。
+/// 为什么：Android cached-app freezer（cgroup.freeze=1）让目标连 PTRACE_CONT 的
+/// 代码都无法执行——实测 mmap 级远程调用全部超时，而目标 State 仍显示 S，
+/// 极难诊断。root 工具要对目标做注入，目标必须能跑起来。
+pub(crate) fn thaw_target_for_session(pid: i32) -> Option<String> {
+    let path = freeze_path(pid)?;
+    let frozen = std::fs::read_to_string(&path).ok()?;
+    if frozen.trim() != "1" {
+        return None;
+    }
+    std::fs::write(&path, "0").ok()?;
+    log_warn!("目标 {} 被系统冻结（cached freezer），会话期间已临时解冻", pid);
+    Some(path)
+}
+
+/// 把冻结位恢复到会话前状态：系统记账里目标仍是冻结态，工具不能留下状态漂移。
+pub(crate) fn restore_target_freeze(path: &str) {
+    if let Err(e) = std::fs::write(path, "1") {
+        log_warn!("恢复目标冻结位失败 {}: {}", path, e);
+    }
+}
+
 /// 调用目标进程的 libc 函数
 ///
 /// # 参数
@@ -238,8 +269,12 @@ pub(crate) fn call_target_function(
             }));
         }
 
-        // 等待进程停止
-        match waitpid(target_pid, None).map_err(|e| format!("等待进程失败: {}", e))? {
+        // 有界等待目标停止（ISSUE-033）：无限期 waitpid 是挂死与孤儿 tracer 的来源。
+        let stop_status = match wait_for_stop_bounded(target_pid, REMOTE_CALL_TIMEOUT_SECS)? {
+            Some(status) => status,
+            None => return abort_hung_remote_call(pid, target_pid, &orig_regs),
+        };
+        match stop_status {
             WaitStatus::Stopped(_, Signal::SIGSEGV) => {
                 // 获取寄存器，检查 PC 是否为预期值
                 let regs = get_registers(pid)?;
@@ -291,6 +326,61 @@ pub(crate) fn call_target_function(
         }
     }
     Err("call_target_function: 超出重试次数".to_string())
+}
+
+/// 远程调用等待上限（ISSUE-033）：超过即认定目标函数不会返回，走恢复序列。
+/// 没有这个上限，rustfrida 会永久阻塞在 waitpid 上，被外层杀掉后留下孤儿 tracer，
+/// 目标后续 attach 全部 EPERM——失败后不可恢复。
+const REMOTE_CALL_TIMEOUT_SECS: u64 = 15;
+/// 超时恢复序列里等待目标停住（PTRACE_EVENT_STOP）的上限。
+const STOP_CONFIRM_TIMEOUT_SECS: u64 = 5;
+
+/// 有界等待目标进入 ptrace 停止态；Ok(None) 表示超时内没有停止事件。
+fn wait_for_stop_bounded(pid: Pid, timeout_secs: u64) -> Result<Option<WaitStatus>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Ok(status) => return Ok(Some(status)),
+            Err(Errno::EINTR) => continue,
+            Err(e) => return Err(format!("等待进程失败: {}", e)),
+        }
+    }
+}
+
+/// 超时恢复序列（顺序契约）：先 INTERRUPT 让目标离开运行态，确认停住后恢复
+/// 寄存器现场，最后把错误交还调用方。恢复是无条件不变量——任何前置步骤失败
+/// 都不允许跳过它，否则线程会留在被劫持的调用体里（实测：留在自旋桩上把主线程
+/// 拖死，目标被 ANR 杀掉）。本函数不 detach——detach 归 Guard/注入流程统一收尾。
+///
+/// 为什么恢复寄存器就足以安全中止阻塞在系统调用里的调用：内核的 -ERESTARTSYS
+/// 重启开关（do_signal）判断的是返回值寄存器 x0 是否为 -ERESTART* 码，而恢复
+/// orig 寄存器已把 x0 改回调用前的值（用户参数，不可能是重启码），重启随之解除
+/// 武装，目标回到调用前的精确现场。若被中止的函数在用户态临界区中途（如持有
+/// 堆锁时陷入等待），回卷无法回退它已做的用户态修改，目标可能需要重启——这是
+/// 已知边界；纯用户态自旋与阻塞在系统调用等待两种形态已在真机反证中验证可恢复。
+/// 若目标连 INTERRUPT 都停不下来（不可中断睡眠），则不恢复现场、直接报错：
+/// 此时 rustfrida 退出后内核会自动 detach，比留下半恢复现场更安全。
+fn abort_hung_remote_call(
+    pid: i32,
+    target_pid: Pid,
+    orig_regs: &UserRegs,
+) -> Result<usize, String> {
+    if let Err(e) = ptrace_request(PTRACE_INTERRUPT, target_pid) {
+        return Err(format!("远程调用超时，且中断请求失败: {}（不恢复现场）", e));
+    }
+    match wait_for_stop_bounded(target_pid, STOP_CONFIRM_TIMEOUT_SECS)? {
+        Some(_) => {
+            set_registers(pid, orig_regs)?;
+            Err("远程调用超时未返回（已中断并恢复现场）".to_string())
+        }
+        None => Err("远程调用超时，目标未能停住（不恢复现场，由进程退出自动 detach）".to_string()),
+    }
 }
 
 /// 向远程进程内存写入任意类型的数据
