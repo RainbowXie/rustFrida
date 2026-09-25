@@ -273,8 +273,10 @@ pub(crate) fn inject_debug(
         }
     }
 
-    attach_to_process(pid)?;
+    // Guard 先于 attach 建立（ISSUE-035）：它拥有冻结位恢复责任，被系统冻结的目标
+    // 必须先解冻才能进入 ptrace 停止等待；attach 失败出口也经由 Drop 恢复冻结位。
     let mut guard = InjectionGuard::new(pid, -1);
+    attach_to_process(pid)?;
     guard.set_offsets(&offsets);
     if let Some(dl) = dl_offsets.as_ref() {
         guard.set_dl_offsets(dl);
@@ -413,13 +415,15 @@ pub(crate) fn inject_debug(
             }
         };
         let target_memfd = create_and_fill_memfd(pid, &offsets, so_data, label)?;
+        // 唯一 dlopen 名：同名会被 bionic soname 缓存合并成单一实例（ISSUE-036 配套）。
+        let load_name = remote::unique_load_name(label);
         guard.own_target_fd(target_memfd);
         // 故障注入点：memfd 已创建并入账但尚未 dlopen/关闭。
         // 覆盖 needs_dlopen 分支，使真实目标的 memfd 泄漏清理可被验证。
         if let Err(e) = fault::maybe_fail(fault::FAULT_MEMFD_CREATED) {
             return Err(e);
         }
-        let handle = match dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl, label) {
+        let handle = match dlopen_agent_via_ptrace(pid, target_memfd, &offsets, dl, &load_name) {
             Ok(h) => h,
             Err(e) => {
                 let _ = call_target_function(pid, offsets.close, &[target_memfd as usize], None);

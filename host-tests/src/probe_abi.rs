@@ -30,7 +30,7 @@ const REQUIRED_FIELDS: &[(&str, usize)] = &[
     ("matched_count", 312),
     ("rmap_matched_count", 316),
     ("matched_base", 320),
-    ("rmap_matched_base", 384),
+    ("rmap_matched_base", 576),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -131,6 +131,7 @@ fn rust_type_layout(ty: &str) -> (usize, usize) {
         "i64" | "u64" => (8, 8),
         "[u8; 256]" => (256, 1),
         "[u64; 8]" => (64, 8),
+        "[u64; 32]" => (256, 8),
         other if other.starts_with('_') => (4, 4),
         other => panic!("unsupported Rust field type: {other}"),
     }
@@ -189,16 +190,16 @@ fn c_and_rust_probe_result_offsets_match() {
 }
 
 #[test]
-fn probe_version_is_two_on_both_sides() {
+fn probe_version_is_three_on_both_sides() {
     let c_src = std::fs::read_to_string(workspace_root().join("loader/probe_so.c")).unwrap();
     let rust_src = std::fs::read_to_string(workspace_root().join("rust_frida/src/injection/probe.rs")).unwrap();
     assert!(
-        c_src.contains("#define PROBE_VERSION 2"),
-        "probe_so.c must declare PROBE_VERSION 2 (v2 identity protocol)"
+        c_src.contains("#define PROBE_VERSION 3"),
+        "probe_so.c must declare PROBE_VERSION 3（v3 = bias 列表扩容至 32，布局变更必须递增版本）"
     );
     assert!(
-        rust_src.contains("const PROBE_VERSION: i32 = 2"),
-        "probe.rs must pin PROBE_VERSION to 2 and verify the probe's self-report"
+        rust_src.contains("const PROBE_VERSION: i32 = 3"),
+        "probe.rs must pin PROBE_VERSION to 3 and verify the probe's self-report"
     );
 }
 

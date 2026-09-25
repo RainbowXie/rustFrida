@@ -274,6 +274,61 @@ fn created_fds_are_reported_for_ownership_gating() {
     );
 }
 
+/// 冻结目标自愈的前提是解冻发生在 attach 等待之前（ISSUE-035）：InjectionGuard
+/// 拥有冻结位恢复责任，必须先于 attach_to_process 创建，否则冻结目标的首次
+/// ptrace-stop 等待一旦失败，解冻根本不会执行，“自愈”名不副实。
+/// 负向证明：修复前 attach 在前时本守卫必须红（本轮 RED 实测如此）。
+#[test]
+fn guard_is_created_before_attach() {
+    for src_path in ["rust_frida/src/injection/normal.rs", "rust_frida/src/injection.rs"] {
+        let src = read(src_path);
+        let guard_pos = src
+            .find("InjectionGuard::new(")
+            .unwrap_or_else(|| panic!("{src_path} must create a guard"));
+        let attach_pos = src
+            .find("attach_to_process(pid")
+            .unwrap_or_else(|| panic!("{src_path} must call attach_to_process(pid)"));
+        assert!(
+            guard_pos < attach_pos,
+            "{src_path}: guard (freeze-thaw owner) must be created before attach_to_process"
+        );
+    }
+}
+
+/// 远程堆分配必须有所有权守卫（ISSUE-037）：任何成功/失败出口都要 free，
+/// 否则错误路径会持续泄漏目标堆（fd/maps/双链门禁都看不到堆泄漏）。
+/// 负向证明：守卫落地前本测试必须红（本轮 RED 实测如此）。
+#[test]
+fn remote_heap_allocations_have_drop_guard() {
+    let remote = code_lower("rust_frida/src/injection/remote.rs");
+    assert!(
+        remote.contains("impl drop for remotealloc"),
+        "remote.rs must own remote heap allocations via a Drop guard"
+    );
+    let probe = code_lower("rust_frida/src/injection/probe.rs");
+    assert!(probe.contains("remotealloc"), "probe result buffer must use the ownership guard");
+    assert!(
+        !probe.contains("call_target_function(pid, offsets.malloc"),
+        "probe must not malloc without the guard"
+    );
+}
+
+/// 集合差分必须携带全量计数（ISSUE-036）：地址列表有容量上限，计数才是全量事实；
+/// 只比列表会让超出容量的新增同名残留隐形（满 8 容量时第 9 个残留实测不可见）。
+#[test]
+fn probe_sets_include_match_count() {
+    let probe = code_lower("rust_frida/src/injection/probe.rs");
+    assert!(
+        probe.contains("match_count="),
+        "probe output must print match counts alongside bias lists"
+    );
+    let script = read("host-tests/scripts/android16-repeat-retry.sh");
+    assert!(
+        script.contains("match_count"),
+        "script must capture and compare match counts"
+    );
+}
+
 /// InjectionGuard 必须在会话期间解冻被系统冷藏的目标，并在收尾恢复冻结位。
 /// 为什么：Android cached-app freezer（cgroup.freeze=1）让目标连 PTRACE_CONT 的代码
 /// 都无法执行——实测 mmap 级远程调用全部超时，而目标 State 仍显示 S，极难诊断。

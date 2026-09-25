@@ -25,6 +25,8 @@ pub(crate) const FAULT_REMOTE_HANG: &str = "remote_hang";
 pub(crate) const FAULT_HIDE_SKIP: &str = "hide_skip";
 /// ISSUE-034 负向测试：探针自卸失败分支必须响亮报错，且可被后续探测发现。
 pub(crate) const FAULT_PROBE_DLCLOSE_FAIL: &str = "probe_dlclose_fail";
+/// ISSUE-037 反证：探针测量中途失败，目标堆缓冲区必须被回收（验证失败路径不泄漏）。
+pub(crate) const FAULT_PROBE_MEASURE_FAIL: &str = "probe_measure_fail";
 
 /// C 侧 g_hide_fault_stage 的取值，与 agent/src/hide_soinfo.h 保持一致。
 pub(crate) const FAULT_STAGE_HIDE_PARTIAL: i32 = 1;

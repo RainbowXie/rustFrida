@@ -109,10 +109,12 @@ pub(crate) fn inject_to_process(
         dl_offsets.print_offsets();
     }
 
-    attach_to_process(pid)?;
+    // Guard 先于 attach 建立（ISSUE-035）：它拥有冻结位恢复责任，被系统冻结的目标
+    // 必须先解冻才能进入 ptrace 停止等待；attach 失败出口也经由 Drop 恢复冻结位。
     let mut guard = InjectionGuard::new(pid, -1);
-    // attach 之后、任何故障点之前就建立 Guard：此后 attach 后路径
-    // 全部经由同一个 Guard 退出，禁止在 Guard 建立前返回（ISSUE-027）。
+    attach_to_process(pid)?;
+    // attach 成功后、任何故障点之前完成资源登记：此后全部经由同一个 Guard 退出，
+    // 禁止绕过 Guard 返回（ISSUE-027）。
     guard.set_offsets(&offsets);
     guard.set_dl_offsets(&dl_offsets);
     // 故障注入点：attach 之后、资源获取之前。

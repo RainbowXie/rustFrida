@@ -52,10 +52,10 @@ struct probe_dl_info {
     void *dli_saddr;
 };
 
-#define PROBE_MATCHED_MAX 8
+#define PROBE_MATCHED_MAX 32
 /* 字面尺寸是 ABI 合同（host-tests 按数值偏移解析），宏是代码便利；
  * 二者必须一致，用编译期断言绑死，否则改宏会静默漂移 ABI。 */
-typedef char probe_matched_max_must_match_literal_8[(PROBE_MATCHED_MAX == 8) ? 1 : -1];
+typedef char probe_matched_max_must_match_literal_32[(PROBE_MATCHED_MAX == 32) ? 1 : -1];
 
 struct probe_result {
     /* 版本，便于 host 校验探针与 host 结构一致。 */
@@ -85,12 +85,12 @@ struct probe_result {
     /* matched_base 已记录数（截断到 PROBE_MATCHED_MAX）。 */
     int matched_count;
     int rmap_matched_count;
-    /* 同名（wwb_so）非自身匹配的 load bias，供 host 按地址集合差分；尺寸字面量 8 由上方编译期断言与 PROBE_MATCHED_MAX 绑定。 */
-    unsigned long long matched_base[8];
-    unsigned long long rmap_matched_base[8];
+    /* 同名（wwb_so）非自身匹配的 load bias，供 host 按地址集合差分；尺寸字面量 32 由上方编译期断言与 PROBE_MATCHED_MAX 绑定；matched_count 是全量计数，超过容量时列表截断但计数仍然精确。 */
+    unsigned long long matched_base[32];
+    unsigned long long rmap_matched_base[32];
 };
 
-#define PROBE_VERSION 2
+#define PROBE_VERSION 3
 
 static int name_contains(const char *s, const char *needle) {
     if (!s)

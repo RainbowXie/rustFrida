@@ -7,14 +7,14 @@ use crate::types::{DlOffsets, LibcOffsets};
 use crate::{log_error, log_info, log_success};
 
 use super::fault;
-use super::remote::{create_and_fill_memfd, dlopen_agent_via_ptrace, remote_dlsym};
+use super::remote::{create_and_fill_memfd, dlopen_agent_via_ptrace, remote_dlsym, unique_load_name, RemoteAlloc};
 
 /// 独立枚举探针：只调 bionic 公开的 dl_iterate_phdr，不引用 hide 代码，
 /// 用于从外部确认注入库是否真的不在 soinfo 链上。
 pub(crate) const PROBE_SO: &[u8] = include_bytes!("../../../loader/build/probe.so");
 
-/// 与 loader/probe_so.c 的 PROBE_VERSION 一致：v2 = 身份核对 + 匹配 bias 列表。
-pub(crate) const PROBE_VERSION: i32 = 2;
+/// 与 loader/probe_so.c 的 PROBE_VERSION 一致：v3 = bias 列表扩容至 32（布局变更）。
+pub(crate) const PROBE_VERSION: i32 = 3;
 
 /// 独立枚举探针的返回结构，必须与 loader/probe_so.c 的 probe_result 一致。
 #[repr(C)]
@@ -34,8 +34,8 @@ pub(crate) struct ProbeResult {
     pub(crate) target_present_rmap: i32,
     pub(crate) matched_count: i32,
     pub(crate) rmap_matched_count: i32,
-    pub(crate) matched_base: [u64; 8],
-    pub(crate) rmap_matched_base: [u64; 8],
+    pub(crate) matched_base: [u64; 32],
+    pub(crate) rmap_matched_base: [u64; 32],
 }
 
 /// read_memory 要求 T: Default；数组字段不满足自动派生，所以手写全零默认值。
@@ -56,8 +56,8 @@ impl Default for ProbeResult {
             target_present_rmap: 0,
             matched_count: 0,
             rmap_matched_count: 0,
-            matched_base: [0u64; 8],
-            rmap_matched_base: [0u64; 8],
+            matched_base: [0u64; 32],
+            rmap_matched_base: [0u64; 32],
         }
     }
 }
@@ -71,10 +71,20 @@ impl ProbeResult {
         items.join(",")
     }
 
-    /// 机器可读的身份/集合输出；脚本的验收断言直接解析这两行。
+    /// 机器可读的身份/集合输出；脚本的验收断言直接解析这些行。
+    /// 计数是全量事实、列表受容量上限（32）约束：两者必须一起比较，
+    /// 否则超出容量的新增同名残留会让列表逐字不变而漏检（ISSUE-036）。
     pub(crate) fn dump_sets(&self) {
-        log_info!("solist_biases={}", Self::bias_list(&self.matched_base, self.matched_count));
-        log_info!("rmap_biases={}", Self::bias_list(&self.rmap_matched_base, self.rmap_matched_count));
+        log_info!(
+            "solist_biases={} solist_match_count={}",
+            Self::bias_list(&self.matched_base, self.matched_count),
+            self.matched_count
+        );
+        log_info!(
+            "rmap_biases={} rmap_match_count={}",
+            Self::bias_list(&self.rmap_matched_base, self.rmap_matched_count),
+            self.rmap_matched_count
+        );
     }
 }
 
@@ -186,9 +196,7 @@ fn count_memfd_wwb(pid: i32) -> Result<usize, String> {
 /// 自身排除规则隐彤——实测泄漏后 total 不变、self_skipped 恒 1、集合差分恒为空。
 /// 唯一名强制每次全新实例：泄漏实例才能以名字身份落进 bias 集合被检出。
 fn unique_probe_name() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NONCE: AtomicU64 = AtomicU64::new(0);
-    format!("probe_{}_{:x}.so", std::process::id(), NONCE.fetch_add(1, Ordering::Relaxed))
+    unique_load_name("probe")
 }
 
 /// 注入探针 SO，在目标进程内用 dl_iterate_phdr 与 _r_debug.r_map 枚举已加载库。
@@ -268,12 +276,15 @@ fn probe_with_handle(
     target: Option<(usize, u64)>,
 ) -> Result<ProbeResult, String> {
     // 结果缓冲区分配在目标进程，探针填完由 host 读回。
+    // RemoteAlloc 守卫接管回收：本函数任一 `?` 出口都不能漏 free（ISSUE-037）。
     let size = size_of::<ProbeResult>();
-    let buf_addr = call_target_function(pid, offsets.malloc, &[size], None)
-        .map_err(|e| format!("探针结果缓冲区分配失败: {}", e))?;
+    let buf = RemoteAlloc::alloc(pid, offsets, size)?;
+    let buf_addr = buf.addr();
     for off in (0..size).step_by(8) {
         write_bytes(pid, buf_addr + off, &[0u8; 8])?;
     }
+    // 故障注入点（ISSUE-037 反证）：分配后任意步骤失败都必须回收目标堆缓冲区。
+    fault::maybe_fail(fault::FAULT_PROBE_MEASURE_FAIL)?;
     // target_sym / target_bias 是传给探针的输入（身份锚点），在清零后写入对应字段；
     // 隐藏后 dladdr 反查不到目标，预填 bias 才能让探针按身份判定 r_map。
     if let Some((sym, bias)) = target {
@@ -292,13 +303,11 @@ fn probe_with_handle(
 
     let fn_ptr = remote_dlsym(pid, dl, offsets, handle, b"probe_solist_visibility\0")?;
     if fn_ptr == 0 {
-        let _ = call_target_function(pid, offsets.free, &[buf_addr], None);
         return Err("dlsym(probe_solist_visibility) 返回 NULL".to_string());
     }
     let rc = call_target_function(pid, fn_ptr, &[r_map_head, buf_addr], None)
         .map_err(|e| format!("调用 probe_solist_visibility 失败: {}", e))? as i32;
     let result = read_memory::<ProbeResult>(pid, buf_addr)?;
-    let _ = call_target_function(pid, offsets.free, &[buf_addr], None);
     if rc != 0 {
         return Err(format!("probe_solist_visibility 返回 {}", rc));
     }

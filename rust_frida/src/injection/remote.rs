@@ -49,9 +49,61 @@ fn report_owned_fd(pid: i32, fd: i32) {
     }
 }
 
+/// 每次载荷加载用唯一 dlopen 名（ISSUE-036 配套）。
+/// 为什么：bionic 按名字/soname 缓存已加载库（empty.so、probe.so 的
+/// -Wl,-soname 与加载名同名），同名重复加载会命中缓存复用同一实例——实测
+/// 8 次 so-empty 只落 1 个实例，多实例语义与容量边界断言全部失效。
+/// 唯一名无法命中固定 soname，每次都是全新实例；dlpi_name 取 memfd 路径，
+/// 名字匹配与身份裁决不受影响。
+pub(crate) fn unique_load_name(base: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let stem = base.trim_end_matches(".so");
+    format!("{}_{}_{:x}.so", stem, std::process::id(), NONCE.fetch_add(1, Ordering::Relaxed))
+}
+
+/// 目标进程远程堆分配的所有权（ISSUE-037）：任何成功/失败出口都自动 free。
+/// 为什么单独成类：错误路径的远程 malloc 泄漏的是目标堆内存，fd/maps/双链
+/// 门禁都观察不到；Drop 是唯一能覆盖所有 `?` 出口的机制。回收失败响亮报告。
+pub(crate) struct RemoteAlloc {
+    pid: i32,
+    offsets: LibcOffsets,
+    addr: usize,
+}
+
+impl RemoteAlloc {
+    pub(crate) fn alloc(pid: i32, offsets: &LibcOffsets, size: usize) -> Result<Self, String> {
+        let addr = call_target_function(pid, offsets.malloc, &[size], None)
+            .map_err(|e| format!("分配目标堆内存失败: {}", e))?;
+        Ok(Self { pid, offsets: *offsets, addr })
+    }
+
+    /// 收养已分配的远程地址（如 alloc_and_write_struct 的产物），后续由 Drop 回收。
+    pub(crate) fn from_raw(pid: i32, offsets: &LibcOffsets, addr: usize) -> Self {
+        Self { pid, offsets: *offsets, addr }
+    }
+
+    pub(crate) fn addr(&self) -> usize {
+        self.addr
+    }
+}
+
+impl Drop for RemoteAlloc {
+    fn drop(&mut self) {
+        if self.addr == 0 {
+            return;
+        }
+        // 最后一次回收机会：失败必须显式报告，静默失败等于承认泄漏。
+        match call_target_function(self.pid, self.offsets.free, &[self.addr], None) {
+            Ok(_) => log_verbose!("目标堆缓冲区已回收 addr=0x{:x}", self.addr),
+            Err(e) => crate::log_error!("目标堆缓冲区回收失败 addr=0x{:x}: {}", self.addr, e),
+        }
+    }
+}
+
 pub(crate) fn create_socketpair_in_target(pid: i32, offsets: &LibcOffsets) -> Result<(i32, i32), String> {
-    let sv_addr = call_target_function(pid, offsets.malloc, &[8], None)
-        .map_err(|e| format!("分配 socketpair 缓冲区失败: {}", e))?;
+    let sv_buf = RemoteAlloc::alloc(pid, offsets, 8)?;
+    let sv_addr = sv_buf.addr();
 
     let ret = call_target_function(pid, offsets.socketpair, &[1, 1, 0, sv_addr], None)
         .map_err(|e| format!("调用 socketpair 失败: {}", e))?;
@@ -65,7 +117,6 @@ pub(crate) fn create_socketpair_in_target(pid: i32, offsets: &LibcOffsets) -> Re
     report_owned_fd(pid, sv[0]);
     report_owned_fd(pid, sv[1]);
 
-    let _ = call_target_function(pid, offsets.free, &[sv_addr], None);
     Ok((sv[0], sv[1]))
 }
 
@@ -95,14 +146,12 @@ pub(crate) fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, 
 /// 在目标进程中调用 memfd_create()，返回目标进程内的 fd 号
 pub(crate) fn create_memfd_in_target(pid: i32, offsets: &LibcOffsets) -> Result<i32, String> {
     let name = b"wwb_so\0";
-    let name_addr = call_target_function(pid, offsets.malloc, &[name.len()], None)
-        .map_err(|e| format!("分配 memfd name 内存失败: {}", e))?;
+    let name_buf = RemoteAlloc::alloc(pid, offsets, name.len())?;
+    let name_addr = name_buf.addr();
     write_bytes(pid, name_addr, name)?;
 
     let ret = call_target_function(pid, offsets.memfd_create, &[name_addr, 0], None)
         .map_err(|e| format!("调用 memfd_create 失败: {}", e))?;
-
-    let _ = call_target_function(pid, offsets.free, &[name_addr], None);
 
     let fd = ret as i32;
     if fd < 0 {
@@ -184,24 +233,22 @@ pub(crate) fn dlopen_agent_via_ptrace(
     lib_name: &str,
 ) -> Result<usize, String> {
     let libdl_name = b"libdl.so\0";
-    let libdl_name_addr = call_target_function(pid, offsets.malloc, &[libdl_name.len()], None)
-        .map_err(|e| format!("分配 libdl 名称失败: {}", e))?;
+    let libdl_name_buf = RemoteAlloc::alloc(pid, offsets, libdl_name.len())?;
+    let libdl_name_addr = libdl_name_buf.addr();
     write_bytes(pid, libdl_name_addr, libdl_name)?;
     let libdl_handle = call_target_function(pid, dl_offsets.dlopen, &[libdl_name_addr, 2], None)
         .map_err(|e| format!("调用 dlopen(libdl.so) 失败: {}", e))?;
-    let _ = call_target_function(pid, offsets.free, &[libdl_name_addr], None);
     if libdl_handle == 0 {
         return Err("dlopen(libdl.so) 返回 NULL".to_string());
     }
 
     let sym_name = b"android_dlopen_ext\0";
-    let sym_name_addr = call_target_function(pid, offsets.malloc, &[sym_name.len()], None)
-        .map_err(|e| format!("分配 android_dlopen_ext 符号名失败: {}", e))?;
+    let sym_name_buf = RemoteAlloc::alloc(pid, offsets, sym_name.len())?;
+    let sym_name_addr = sym_name_buf.addr();
     write_bytes(pid, sym_name_addr, sym_name)?;
     let android_dlopen_ext_addr =
         call_target_function(pid, dl_offsets.dlsym, &[libdl_handle, sym_name_addr], None)
             .map_err(|e| format!("调用 dlsym(android_dlopen_ext) 失败: {}", e))?;
-    let _ = call_target_function(pid, offsets.free, &[sym_name_addr], None);
     if android_dlopen_ext_addr == 0 {
         return Err("dlsym(android_dlopen_ext) 返回 NULL".to_string());
     }
@@ -209,8 +256,8 @@ pub(crate) fn dlopen_agent_via_ptrace(
 
     let mut lib_name_buf = lib_name.as_bytes().to_vec();
     lib_name_buf.push(0);
-    let name_addr = call_target_function(pid, offsets.malloc, &[lib_name_buf.len()], None)
-        .map_err(|e| format!("分配 lib_name 内存失败: {}", e))?;
+    let name_buf = RemoteAlloc::alloc(pid, offsets, lib_name_buf.len())?;
+    let name_addr = name_buf.addr();
     write_bytes(pid, name_addr, &lib_name_buf)?;
 
     let ext_info = AndroidDlextinfo {
@@ -218,13 +265,13 @@ pub(crate) fn dlopen_agent_via_ptrace(
         library_fd: target_memfd,
         ..Default::default()
     };
-    let ext_info_addr = alloc_and_write_struct(pid, offsets.malloc, &ext_info, "android_dlextinfo")?;
+    // 收养 alloc_and_write_struct 的产物：后续任一 `?` 出口都由 Drop 回收。
+    let ext_info_buf =
+        RemoteAlloc::from_raw(pid, offsets, alloc_and_write_struct(pid, offsets.malloc, &ext_info, "android_dlextinfo")?);
+    let ext_info_addr = ext_info_buf.addr();
 
     let handle = call_target_function(pid, android_dlopen_ext_addr, &[name_addr, 2, ext_info_addr], None)
         .map_err(|e| format!("调用 android_dlopen_ext 失败: {}", e))?;
-
-    let _ = call_target_function(pid, offsets.free, &[name_addr], None);
-    let _ = call_target_function(pid, offsets.free, &[ext_info_addr], None);
 
     if handle == 0 {
         if let Ok(err_ptr) = call_target_function(pid, dl_offsets.dlerror, &[], None) {
@@ -264,10 +311,8 @@ pub(crate) fn remote_dlsym(
     handle: usize,
     name: &[u8],
 ) -> Result<usize, String> {
-    let name_addr = call_target_function(pid, offsets.malloc, &[name.len()], None)
-        .map_err(|e| format!("分配符号名失败: {}", e))?;
-    write_bytes(pid, name_addr, name)?;
-    let ptr = call_target_function(pid, dl.dlsym, &[handle, name_addr], None);
-    let _ = call_target_function(pid, offsets.free, &[name_addr], None);
+    let name_addr = RemoteAlloc::alloc(pid, offsets, name.len())?;
+    write_bytes(pid, name_addr.addr(), name)?;
+    let ptr = call_target_function(pid, dl.dlsym, &[handle, name_addr.addr()], None);
     ptr.map_err(|e| format!("dlsym 失败: {}", e))
 }

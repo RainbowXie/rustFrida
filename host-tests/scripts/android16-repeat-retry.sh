@@ -61,6 +61,19 @@ else
   die "LOCAL_BIN is required: pass the local fault-test artifact path to bind receipts to HEAD"
 fi
 
+# 显式冻结/解冻目标（root）：冻结反证需要确定性冻结位，不等系统 cached-freezer。
+target_freeze_file() {
+  local pid="$1" rel
+  rel=$(adb -s "$SERIAL" shell "su -c 'grep \"^0::\" /proc/$pid/cgroup'" | tr -d '\r' | sed 's/^0:://')
+  [[ -n "$rel" ]] || die "target $pid has no cgroup v2 entry"
+  printf '/sys/fs/cgroup%s/cgroup.freeze' "$rel"
+}
+
+freeze_target() {
+  local pid="$1" state="$2"
+  adb -s "$SERIAL" shell "su -c 'echo $state > $(target_freeze_file "$pid")'" || die "freeze_target($state) failed"
+}
+
 current_pid() { adb -s "$SERIAL" shell pidof "$PACKAGE" 2>/dev/null | tr -d '\r' | awk '{print $1}'; }
 
 launch_target() {
@@ -162,8 +175,17 @@ assert_clean_after() {
 # 重复运行不污染集合；集合里多出的任何地址 = 未卸载的探针或未摘链的库。
 PROBE_BASELINE="sol= rmap="
 
+# 集合提取：bias 列表 + 全量计数（#分隔）。计数是全量事实、列表受容量上限约束，
+# 两者必须一起比较（ISSUE-036）：只比列表会让超出容量的新增同名残留隐形。
+extract_sets() {
+  local out_file="$1" sol rmap
+  sol=$(sed -n 's/.*solist_biases=\([0-9a-fx,]*\).*solist_match_count=\([0-9]*\).*/\1#\2/p' "$out_file" | head -1)
+  rmap=$(sed -n 's/.*rmap_biases=\([0-9a-fx,]*\).*rmap_match_count=\([0-9]*\).*/\1#\2/p' "$out_file" | head -1)
+  printf 'sol=%s rmap=%s' "$sol" "$rmap"
+}
+
 probe_sets() {
-  local label="$1" pid="$2" out_file rc sol rmap
+  local label="$1" pid="$2" out_file rc
   out_file=$(mktemp)
   set +e
   timeout "$TIMEOUT_SEC" adb -s "$SERIAL" shell su -c \
@@ -174,9 +196,7 @@ probe_sets() {
     sed -e "s/^/[repeat:$label] /" "$out_file" | tail -n 25
     die "$label: independent probe failed (exit $rc)"
   fi
-  sol=$(sed -n 's/.*solist_biases=\([0-9a-fx,]*\).*/\1/p' "$out_file" | head -1 | tr ',' '\n' | LC_ALL=C sort | paste -sd, -)
-  rmap=$(sed -n 's/.*rmap_biases=\([0-9a-fx,]*\).*/\1/p' "$out_file" | head -1 | tr ',' '\n' | LC_ALL=C sort | paste -sd, -)
-  printf 'sol=%s rmap=%s' "$sol" "$rmap"
+  extract_sets "$out_file"
 }
 
 assert_probe_clean() {
@@ -322,6 +342,30 @@ log "hide_skip: 未摘链目标被探针按身份检出（假阴防护）"
 # 负向路径的失败清理：未摘链目标必须被 Drop dlclose，地址集合回到基线。
 assert_probe_clean "post-hide-skip" "$pid"
 
+log "--- 集合差分计数自测（ISSUE-036）：列表相同、计数漂移必须被检出 ---"
+neg_out=$(mktemp)
+printf '%s\n' '[*] solist_biases=0x1,0x2 solist_match_count=8' '[*] rmap_biases=0x1 rmap_match_count=8' >"$neg_out"
+neg1=$(extract_sets "$neg_out")
+printf '%s\n' '[*] solist_biases=0x1,0x2 solist_match_count=9' '[*] rmap_biases=0x1 rmap_match_count=8' >"$neg_out"
+neg2=$(extract_sets "$neg_out")
+[[ "$neg1" != "$neg2" ]] || die "sets extraction is vacuous: count-only drift (8→9, same list) must be detected"
+log "negative-test: count-only drift detected by set extraction (not vacuous)"
+
+log "--- 同名实例容量边界反例（ISSUE-036）：8 个基线 + 第 9 个必须被捕获 ---"
+pid=$(launch_target)
+for i in $(seq 1 8); do
+  timeout "$TIMEOUT_SEC" adb -s "$SERIAL" shell su -c \
+    "$REMOTE_BIN --pid $pid --debug-inject so-empty" >/dev/null 2>&1 || die "boundary so-empty #$i failed"
+done
+sets8=$(probe_sets "probe-at-8" "$pid")
+log "8-instance sets: [$sets8]"
+timeout "$TIMEOUT_SEC" adb -s "$SERIAL" shell su -c \
+  "$REMOTE_BIN --pid $pid --debug-inject so-empty" >/dev/null 2>&1 || die "boundary so-empty #9 failed"
+sets9=$(probe_sets "probe-at-9" "$pid")
+[[ "$sets9" != "$sets8" ]] || die "capacity boundary: 9th same-name instance not detected (count/list drift missing)"
+log "9th same-name instance detected via count/list drift: [$sets9]"
+PROBE_BASELINE="$sets9"
+
 log "=== 4. 远程调用有界等待反证（ISSUE-033）==="
 # 自旋桩远程调用永不返回：必须在有界等待后中断、恢复现场并响亮报错，
 # 且目标仍可再次 attach（后续 probe 与 retry 注入即为证）。
@@ -330,13 +374,31 @@ log "=== 4. 远程调用有界等待反证（ISSUE-033）==="
 run_fault "fault-remote-hang" "$pid" "remote_hang" "so-only" "" strict "malloc/free 正常"
 run_once "retry-after-remote-hang" "$pid" "so-only" ""
 
-log "=== 5. 探针自卸保证（ISSUE-034）==="
+log "=== 5. 冻结目标自愈反证（ISSUE-035）==="
+# 确定性冻结：直接把 cgroup.freeze 置 1，不等系统 cached-freezer。
+# 断言：解冻责任先于 attach（Guard 创建即解冻），attach、远程调用、
+# 故障重试全部在真实冻结过的目标上通过，且每次会话收尾恢复冻结位。
+freeze_target "$pid" 1
+grep -q '^1' <<<"$(adb -s "$SERIAL" shell "su -c 'cat $(target_freeze_file "$pid")'" | tr -d '\r')" \
+  || die "freeze_target: target not actually frozen"
+log "target frozen: $(target_freeze_file "$pid") = 1"
+run_once "frozen-attach" "$pid" "so-only" ""
+run_fault "frozen-fault" "$pid" "memfd_created" "so-only" "" strict
+run_once "frozen-retry" "$pid" "so-only" ""
+# 每次会话收尾都把冻结位恢复成会话前状态（1）；显式解冻恢复后续测试环境。
+freeze_target "$pid" 0
+log "frozen-target self-healing verified (attach + remote calls + fault retry)"
+
+log "=== 6. 探针自卸保证（ISSUE-034/037）==="
 # 连续两次独立探测互不污染：第一次的探针必须已自卸，否则第二次会把它当残留。
 sets1=$(probe_sets "probe-consec#1" "$pid")
 [[ "$sets1" == "$PROBE_BASELINE" ]] || die "probe-consec#1: sets drifted: [$sets1] != [$PROBE_BASELINE]"
 sets2=$(probe_sets "probe-consec#2" "$pid")
 [[ "$sets2" == "$PROBE_BASELINE" ]] || die "probe-consec#2: sets drifted: [$sets2] != [$PROBE_BASELINE]"
 log "consecutive probes stable at baseline [$sets2]"
+# 测量中途失败必须回收目标堆缓冲区（ISSUE-037）：错误路径泄漏的是目标堆，
+# fd/maps/双链门禁都看不到，回收日志是唯一收据。
+run_fault "fault-probe-measure-fail" "$pid" "probe_measure_fail" "probe-only" "" strict "目标堆缓冲区已回收"
 # 卸载失败分支必须响亮报错（不能记日志后照常返回成功）。
 out_file=$(mktemp)
 set +e
@@ -370,7 +432,7 @@ pid=$(launch_target)
 PROBE_BASELINE=$(probe_sets "probe-baseline-fresh" "$pid")
 log "target restarted (pid=$pid), baseline $PROBE_BASELINE"
 
-log "=== 6. spawn 重复运行与失败后重试 ==="
+log "=== 7. spawn 重复运行与失败后重试 ==="
 # spawn 全流程（启动新进程 + 注入 + 15s 存活监控 + Zygote patch 还原）耗时约 25s，
 # 超时必须给足：截断输出会把成功误判为“未知返回”。
 run_spawn_once() {
